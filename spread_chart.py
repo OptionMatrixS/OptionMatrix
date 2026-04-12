@@ -4,6 +4,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in [_ROOT, _HERE]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
 """pages/spread_chart.py — Spread Chart Builder with TradingView-style scroll/zoom"""
 
 import streamlit as st
@@ -18,8 +19,12 @@ _SS = st.session_state
 
 def _init():
     defaults = {
-        "sp_n_legs": 2, "sp_chart_type": "Candlestick",
-        "sp_tf": "1m", "sp_result": None, "sp_df": None,
+        "sp_n_legs": 2,
+        "sp_chart_type": "Candlestick",
+        "sp_tf": "1m",
+        "sp_result": None,
+        "sp_df": None,
+        "sp_legs_live": [],   # persists across page switches
     }
     for k, v in defaults.items():
         if k not in _SS:
@@ -36,7 +41,6 @@ def _build_chart(df, result, chart_type, tf):
                      f"  [{tf}]")
 
     fig = go.Figure()
-
     if chart_type == "Candlestick":
         fig.add_trace(go.Candlestick(
             x=df["time"], open=df["open"], high=df["high"],
@@ -53,7 +57,6 @@ def _build_chart(df, result, chart_type, tf):
         ))
 
     fig.add_hline(y=0, line=dict(color="#363a45", width=1, dash="dot"))
-
     last = df["close"].iloc[-1]
     fig.add_annotation(
         x=df["time"].iloc[-1], y=last,
@@ -62,39 +65,22 @@ def _build_chart(df, result, chart_type, tf):
         bgcolor="#26a69a" if last >= 0 else "#ef5350",
         borderpad=4, xanchor="left",
     )
-
     fig.update_layout(
         title=dict(text=title, font=dict(size=12, color="#d1d4dc", family="IBM Plex Sans"), x=0, xref="paper"),
         paper_bgcolor="#131722", plot_bgcolor="#131722",
-        xaxis=dict(
-            gridcolor="#1e222d", gridwidth=0.5,
-            tickfont=dict(size=10, color="#787b86", family="JetBrains Mono"),
-            rangeslider=dict(visible=False),
-            showline=False, zeroline=False,
-            # FIX 2: Enable TradingView-style scroll and zoom on X axis
-            fixedrange=False,
-            type="date",
-        ),
-        yaxis=dict(
-            gridcolor="#1e222d", gridwidth=0.5,
-            tickfont=dict(size=10, color="#787b86", family="JetBrains Mono"),
-            showline=False, zeroline=False,
-            side="right",
-            # FIX 2: Enable scroll/zoom on Y axis independently
-            fixedrange=False,
-        ),
+        xaxis=dict(gridcolor="#1e222d", gridwidth=0.5,
+                   tickfont=dict(size=10, color="#787b86", family="JetBrains Mono"),
+                   rangeslider=dict(visible=False), showline=False, zeroline=False,
+                   fixedrange=False, type="date"),
+        yaxis=dict(gridcolor="#1e222d", gridwidth=0.5,
+                   tickfont=dict(size=10, color="#787b86", family="JetBrains Mono"),
+                   showline=False, zeroline=False, side="right", fixedrange=False),
         legend=dict(font=dict(size=11, color="#787b86"), bgcolor="rgba(0,0,0,0)"),
-        margin=dict(l=10, r=68, t=36, b=28),
-        height=420,
+        margin=dict(l=10, r=68, t=36, b=28), height=420,
         hovermode="x unified",
-        hoverlabel=dict(
-            bgcolor="#1e222d", bordercolor="#2a2e39",
-            font=dict(size=11, color="#d1d4dc", family="JetBrains Mono")
-        ),
-        # FIX 2: drag mode pan by default (like TradingView)
+        hoverlabel=dict(bgcolor="#1e222d", bordercolor="#2a2e39",
+                        font=dict(size=11, color="#d1d4dc", family="JetBrains Mono")),
         dragmode="pan",
-        # FIX 2: enable scroll zoom
-        newshape=dict(line_color="#2962ff"),
     )
     return fig
 
@@ -116,17 +102,18 @@ def render():
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            _SS.sp_n_legs = st.selectbox("Legs", list(range(2, 7)),
-                                          index=_SS.sp_n_legs - 2, key="sp_legs_sel")
+            n_legs = st.selectbox("Legs", list(range(2, 7)),
+                                  index=_SS.sp_n_legs - 2, key="sp_legs_sel")
+            _SS.sp_n_legs = n_legs
         with c2:
             _SS.sp_chart_type = st.selectbox("Chart", ["Candlestick", "Line"], key="sp_ct_sel")
         with c3:
             _SS.sp_tf = st.selectbox("TF", list(TF_MAP.keys()), key="sp_tf_sel")
 
-        n = _SS.sp_n_legs
+        # ── Build legs — read widget values directly from session state keys ──
+        # This way the legs list is always current even after page switches
         legs = []
-
-        for i in range(n):
+        for i in range(n_legs):
             st.markdown(
                 f'<div style="font-size:10px;color:#787b86;margin:10px 0 5px;">'
                 f'<span style="background:#2a2e39;padding:2px 8px;border-radius:10px;'
@@ -135,14 +122,17 @@ def render():
             )
             ci1, ci2 = st.columns([1, 2])
             with ci1:
-                idx = st.selectbox("Index", ["NIFTY", "SENSEX"], key=f"sp_idx_{i}",
-                                   label_visibility="collapsed")
+                idx = st.selectbox("Index", ["NIFTY", "SENSEX"],
+                                   key=f"sp_idx_{i}", label_visibility="collapsed")
             with ci2:
                 strikes = NIFTY_STRIKES if idx == "NIFTY" else SENSEX_STRIKES
                 atm = 22800 if idx == "NIFTY" else 82500
                 def_s = min(strikes, key=lambda x: abs(x - (atm + 200 if i % 2 == 0 else atm - 200)))
-                strike = st.selectbox("Strike", strikes, index=strikes.index(def_s),
-                                      key=f"sp_strike_{i}", label_visibility="collapsed")
+                # keep previously selected strike if index didn't change
+                prev_key = f"sp_strike_{i}"
+                strike = st.selectbox("Strike", strikes,
+                                      index=strikes.index(def_s),
+                                      key=prev_key, label_visibility="collapsed")
 
             ci3, ci4, ci5, ci6 = st.columns(4)
             exps = NIFTY_EXPIRIES if idx == "NIFTY" else SENSEX_EXPIRIES
@@ -169,13 +159,23 @@ def render():
             )
             legs.append(dict(index=idx, strike=strike, expiry=expiry,
                              cp=cp, bs=bs, ratio=ratio, ltp=ltp, net=round(signed, 2)))
-            if i < n - 1:
+            if i < n_legs - 1:
                 st.markdown('<hr style="margin:6px 0;border-color:#2a2e39;">', unsafe_allow_html=True)
 
-        # Store legs in session for Safety Calculator to read
+        # ── Always persist legs to session state ──────────────────────────────
+        # Store with a stable key so Safety Calculator always has the latest
         _SS.sp_legs_live = legs
+        # Also store a copy keyed by n_legs so it survives leg count changes
+        _SS[f"sp_legs_snapshot_{n_legs}"] = legs
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+        # Show sync status for Safety Calculator
+        st.markdown(
+            f'<div style="font-size:10px;color:#26a69a;margin-bottom:6px;">✓ {n_legs} legs synced to Safety Calculator</div>',
+            unsafe_allow_html=True
+        )
+
         if st.button("⚡  Calculate & Plot", use_container_width=True, type="primary"):
             buys  = [l for l in legs if l["bs"] == "Buy"]
             sells = [l for l in legs if l["bs"] == "Sell"]
@@ -198,7 +198,7 @@ def render():
             st.rerun()
 
         if _SS.sp_result:
-            r = _SS.sp_result
+            r  = _SS.sp_result
             sv = r["spread"]
             st.markdown("---")
             st.markdown(
@@ -223,31 +223,29 @@ def render():
             st.dataframe(df_legs, use_container_width=True, hide_index=True)
 
     with chart_col:
-        df = _SS.sp_df if _SS.sp_df is not None else generate_spread_ohlcv(25, 80)
+        df  = _SS.sp_df if _SS.sp_df is not None else generate_spread_ohlcv(25, 80)
         fig = _build_chart(df, _SS.sp_result, _SS.sp_chart_type, _SS.sp_tf)
-
-        # FIX 2: scrollZoom=True enables mouse-wheel zoom like TradingView
         st.plotly_chart(fig, use_container_width=True,
                         config={
                             "displayModeBar": True,
                             "displaylogo": False,
-                            "scrollZoom": True,           # ← mouse wheel zoom on both axes
+                            "scrollZoom": True,
                             "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
                             "modeBarButtonsToRemove": ["autoScale2d", "lasso2d", "select2d"],
                             "toImageButtonOptions": {"format": "png", "filename": "spread_chart"},
                         })
 
         if _SS.sp_result:
-            r = _SS.sp_result
+            r  = _SS.sp_result
             sv = r["spread"]
             mp = r["max_profit"]
             ml = r["max_loss"]
             items = [
-                ("SPREAD",     f"{sv:+.2f}",                                    "#26a69a" if sv >= 0 else "#ef5350"),
-                ("NET PREM",   f"{r['net_prem']:+.2f}",                         "#d1d4dc"),
-                ("MAX PROFIT", "Unlimited" if mp is None else f"{mp:.2f}",       "#26a69a"),
-                ("MAX LOSS",   f"{ml:.2f}" if ml else "—",                       "#ef5350"),
-                ("BREAKEVEN",  f"{r['be']:.0f}" if r['be'] else "—",            "#d1d4dc"),
+                ("SPREAD",     f"{sv:+.2f}",                               "#26a69a" if sv >= 0 else "#ef5350"),
+                ("NET PREM",   f"{r['net_prem']:+.2f}",                    "#d1d4dc"),
+                ("MAX PROFIT", "Unlimited" if mp is None else f"{mp:.2f}", "#26a69a"),
+                ("MAX LOSS",   f"{ml:.2f}" if ml else "—",                 "#ef5350"),
+                ("BREAKEVEN",  f"{r['be']:.0f}" if r['be'] else "—",       "#d1d4dc"),
             ]
             cols = st.columns(5)
             for col, (label, val, color) in zip(cols, items):
