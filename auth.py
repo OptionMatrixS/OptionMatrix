@@ -6,7 +6,6 @@ from datetime import datetime
 
 DB_PATH = "option_matrix.db"
 
-# ─── DB init ──────────────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -23,21 +22,18 @@ def init_db():
             approved_at TEXT
         )
     """)
-    # Ensure default admin exists
     admin_pw = _hash("admin123")
     c.execute("""
         INSERT OR IGNORE INTO users (username, email, password, role, approved_tools)
-        VALUES (?, ?, ?, 'admin', 'spread,iv,multiplier')
+        VALUES (?, ?, ?, 'admin', 'spread,iv,multiplier,safety')
     """, ("admin", "admin@optionmatrix.com", admin_pw))
     conn.commit()
     conn.close()
 
-
 def _hash(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
 
-
-def register_user(username: str, email: str, password: str) -> tuple[bool, str]:
+def register_user(username: str, email: str, password: str) -> tuple:
     init_db()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -54,8 +50,7 @@ def register_user(username: str, email: str, password: str) -> tuple[bool, str]:
     finally:
         conn.close()
 
-
-def login_user(username: str, password: str) -> tuple[bool, dict]:
+def login_user(username: str, password: str) -> tuple:
     init_db()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -73,28 +68,21 @@ def login_user(username: str, password: str) -> tuple[bool, dict]:
     tools = [t.strip() for t in tools_str.split(",") if t.strip()]
     return True, {"username": username_, "role": role, "tools": tools, "subscription": sub}
 
-
 def check_auth():
     return st.session_state.get("logged_in", False)
 
-
-# ─── Login / Register page ────────────────────────────────────────────────────
 def render_login_page():
     init_db()
 
     st.markdown("""
-    <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;
-                background:#131722;position:fixed;top:0;left:0;right:0;bottom:0;z-index:-1;">
-    </div>
-    <div style="max-width:420px;margin:60px auto 0;padding:0 16px;">
+    <style>
+    .main .block-container { padding-top: 2rem; }
+    </style>
+    <div style="max-width:420px;margin:40px auto 0;padding:0 16px;">
       <div style="text-align:center;margin-bottom:32px;">
-        <div style="font-size:42px;margin-bottom:8px;">⚡</div>
-        <div style="font-size:28px;font-weight:700;color:#d1d4dc;letter-spacing:0.03em;">
-          Option Matrix
-        </div>
-        <div style="font-size:13px;color:#787b86;margin-top:6px;">
-          Professional Options Analytics Platform
-        </div>
+        <div style="font-size:48px;margin-bottom:8px;">⚡</div>
+        <div style="font-size:30px;font-weight:700;color:#d1d4dc;letter-spacing:0.03em;">Option Matrix</div>
+        <div style="font-size:13px;color:#787b86;margin-top:6px;">Professional Options Analytics Platform</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -125,13 +113,7 @@ def render_login_page():
                         st.warning("⏳ Your account is pending admin approval.")
                     else:
                         st.error("Invalid username or password.")
-
-            st.markdown("""
-            <div style="font-size:11px;color:#787b86;text-align:center;margin-top:12px;">
-              Default admin: <code style="color:#2962ff;">admin</code> /
-              <code style="color:#2962ff;">admin123</code>
-            </div>
-            """, unsafe_allow_html=True)
+            # FIX 1: Removed admin credentials hint from login page
 
         with tab_reg:
             st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
