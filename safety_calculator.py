@@ -99,46 +99,10 @@ def render():
     </div>
     """, unsafe_allow_html=True)
 
-    # Primary source: sp_legs_live set by spread_chart.py
     source_legs = _SS.get("sp_legs_live", [])
 
-    # Fallback: reconstruct from Streamlit widget keys if page was refreshed
-    # (widget keys survive page switches even when sp_legs_live is lost)
     if not source_legs:
-        n_legs_stored = _SS.get("sp_n_legs", 0)
-        if n_legs_stored >= 2:
-            rebuilt = []
-            for i in range(n_legs_stored):
-                idx    = _SS.get(f"sp_idx_{i}")
-                strike = _SS.get(f"sp_strike_{i}")
-                expiry = _SS.get(f"sp_exp_{i}")
-                cp     = _SS.get(f"sp_cp_{i}")
-                bs     = _SS.get(f"sp_bs_{i}")
-                ratio  = _SS.get(f"sp_ratio_{i}", 1)
-                if all([idx, strike, expiry, cp, bs]):
-                    ltp    = get_option_price(idx, strike, expiry, cp)
-                    signed = ltp * ratio if bs == "Buy" else -ltp * ratio
-                    rebuilt.append(dict(index=idx, strike=strike, expiry=expiry,
-                                        cp=cp, bs=bs, ratio=ratio, ltp=ltp,
-                                        net=round(signed, 2)))
-            if rebuilt:
-                source_legs = rebuilt
-                _SS.sp_legs_live = rebuilt   # restore it
-
-    if not source_legs:
-        st.markdown("""
-        <div style="background:#1e222d;border:1px solid #2a2e39;border-left:3px solid #ff9800;
-                    border-radius:6px;padding:16px 20px;margin:20px 0;">
-          <div style="font-size:14px;color:#ff9800;font-weight:500;margin-bottom:6px;">
-            ⚠️ No legs configured yet
-          </div>
-          <div style="font-size:13px;color:#787b86;">
-            Go to <b style="color:#d1d4dc;">Spread Calculator</b> in the sidebar,
-            set up your legs (index, strike, expiry, CE/PE, Buy/Sell),
-            then come back here. The inputs will sync automatically.
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.info("⬅️  Go to Spread Calculator first and set up your legs, then come back here.")
         return
 
     n_legs = len(source_legs)
