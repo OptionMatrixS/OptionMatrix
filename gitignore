@@ -1,4 +1,5 @@
 # ── SECRETS — never commit these ──────────────────────────────
+.env
 .streamlit/secrets.toml
 *.toml
 
