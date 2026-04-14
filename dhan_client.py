@@ -37,15 +37,37 @@ def _load_master() -> pd.DataFrame:
     return st.session_state.dhan_master
 
 
+from datetime import datetime
+
 def _expiry_fmt(expiry_str: str) -> str:
-    """Convert '13 Apr' → '2025-04-13'"""
-    months = {"Jan":"01","Feb":"02","Mar":"03","Apr":"04","May":"05","Jun":"06",
-              "Jul":"07","Aug":"08","Sep":"09","Oct":"10","Nov":"11","Dec":"12"}
-    parts = expiry_str.strip().split()
-    day   = parts[0].zfill(2)
-    mon   = months.get(parts[1], "01")
-    year  = str(datetime.now().year)
-    return f"{year}-{mon}-{day}"
+    """Convert multiple formats to YYYY-MM-DD"""
+
+    expiry_str = str(expiry_str).strip()
+
+    # Case 1: Already correct format
+    try:
+        return datetime.strptime(expiry_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except:
+        pass
+
+    # Case 2: "10 Apr"
+    try:
+        year = datetime.now().year
+        dt = datetime.strptime(f"{expiry_str} {year}", "%d %b %Y")
+        return dt.strftime("%Y-%m-%d")
+    except:
+        pass
+
+    # Case 3: "10 Apr 2026"
+    try:
+        dt = datetime.strptime(expiry_str, "%d %b %Y")
+        return dt.strftime("%Y-%m-%d")
+    except:
+        pass
+
+    # Fallback (important for debugging)
+    print("⚠️ Unknown expiry format:", expiry_str)
+    return expiry_str
 
 
 def get_security_id(index: str, strike: int, expiry_str: str, cp: str) -> str:
