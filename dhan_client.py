@@ -54,17 +54,19 @@ def _exchange(index: str) -> str:
 
 # ─── Live expiries & strikes ──────────────────────────────────────────────────
 def get_expiries(index: str) -> list:
+    df    = _load_master()
+    exch  = _exchange(index)
+    uname = _underlying(index)
+    mask  = (df["SEM_EXM_EXCH_ID"] == exch) &             (df["SEM_TRADING_SYMBOL"].str.contains(uname, na=False))
+    today  = pd.Timestamp(datetime.now().date())
+    dates  = sorted([e for e in df[mask]["SEM_EXPIRY_DATE"].dropna().unique() if e >= today])
+    if not dates:
+        raise ValueError(f"No expiries found for {index} ({exch}). Check Dhan master CSV.")
+    # Use %-d on Linux; on Windows use %#d
     try:
-        df    = _load_master()
-        exch  = _exchange(index)
-        uname = _underlying(index)
-        mask  = (df["SEM_EXM_EXCH_ID"] == exch) & \
-                (df["SEM_TRADING_SYMBOL"].str.contains(uname, na=False))
-        today  = pd.Timestamp(datetime.now().date())
-        dates  = sorted([e for e in df[mask]["SEM_EXPIRY_DATE"].dropna().unique() if e >= today])
         return [e.strftime("%-d %b") for e in dates[:12]]
-    except Exception:
-        return []
+    except ValueError:
+        return [e.strftime("%#d %b") for e in dates[:12]]
 
 def get_strikes(index: str, expiry_str: str) -> list:
     try:
