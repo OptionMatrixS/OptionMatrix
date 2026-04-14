@@ -50,33 +50,42 @@ def _expiry_fmt(expiry_str: str) -> str:
 
 def get_security_id(index: str, strike: int, expiry_str: str, cp: str) -> str:
     """Look up Dhan security_id for an option contract."""
-    cache_key = f"dhan_token_{index}_{strike}_{expiry_str}_{cp}"
+
+    print("DEBUG INPUT:", index, strike, expiry_str, cp)
+
+    strike = int(float(strike))
+    cp = cp.upper()
+    expiry_fmt = _expiry_fmt(expiry_str)
+
+    cache_key = f"dhan_token_{index}_{strike}_{expiry_fmt}_{cp}"
     if cache_key in st.session_state:
         return st.session_state[cache_key]
 
-    df         = _load_master()
+    df = _load_master()
+
     exchange   = "NSE_FO" if index == "NIFTY" else "BSE_FO"
     underlying = "NIFTY" if index == "NIFTY" else "SENSEX"
-    opt_type   = "CALL" if cp == "CE" else "PUT"
-    expiry_fmt = _expiry_fmt(expiry_str)
+    opt_type   = cp   # ✅ FIXED
 
     mask = (
         (df["SEM_EXM_EXCH_ID"] == exchange) &
         (df["SEM_TRADING_SYMBOL"].str.contains(underlying, na=False)) &
-        (df["SEM_STRIKE_PRICE"]  == float(strike)) &
-        (df["SEM_EXPIRY_DATE"]   == expiry_fmt) &
-        (df["SEM_OPTION_TYPE"]   == opt_type)
+        (df["SEM_STRIKE_PRICE"].astype(float) == float(strike)) &
+        (df["SEM_OPTION_TYPE"] == opt_type) &
+        (df["SEM_EXPIRY_DATE"].astype(str).str.contains(expiry_fmt))  # ✅ FIXED
     )
+
     result = df[mask]
+
     if result.empty:
         raise ValueError(
             f"No security found: {index} {strike} {expiry_str} {cp} "
             f"(looked for expiry={expiry_fmt}, exchange={exchange})"
         )
+
     sid = str(result.iloc[0]["SEM_SMST_SECURITY_ID"])
     st.session_state[cache_key] = sid
     return sid
-
 
 # ─── Live LTP ─────────────────────────────────────────────────────────────────
 def get_live_ltp(index: str, strike: int, expiry: str, cp: str) -> float:
