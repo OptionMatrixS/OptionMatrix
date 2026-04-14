@@ -7,16 +7,12 @@ import pandas as pd
 from datetime import datetime, timedelta
 import urllib.request
 import io
-
-try:
-    from dhanhq import dhanhq
-except ImportError:
-    raise ImportError("Run: pip install dhanhq")
+from dhanhq import dhanhq
 
 
-# ─── Auth ─────────────────────────────────────────────────────────────────────
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
 def get_dhan_client():
-    if "dhan_client" in st.session_state and st.session_state.dhan_client:
+    if "dhan_client" in st.session_state:
         return st.session_state.dhan_client
 
     client = dhanhq(
@@ -27,7 +23,7 @@ def get_dhan_client():
     return client
 
 
-# ─── Master script lookup ─────────────────────────────────────────────────────
+# ─── LOAD MASTER ──────────────────────────────────────────────────────────────
 def _load_master() -> pd.DataFrame:
     if "dhan_master" not in st.session_state:
         url = "https://images.dhan.co/api-data/api-scrip-master.csv"
@@ -37,7 +33,7 @@ def _load_master() -> pd.DataFrame:
     return st.session_state.dhan_master
 
 
-# ─── AUTO EXPIRY (FIXED) ──────────────────────────────────────────────────────
+# ─── AUTO EXPIRY ──────────────────────────────────────────────────────────────
 def get_next_expiry(index: str):
     today = datetime.now()
 
@@ -54,17 +50,15 @@ def get_next_expiry(index: str):
     return expiry.strftime("%d %b")
 
 
-# ─── EXPIRY FORMAT FIX ────────────────────────────────────────────────────────
+# ─── EXPIRY FORMAT ────────────────────────────────────────────────────────────
 def _expiry_fmt(expiry_str: str) -> str:
     expiry_str = str(expiry_str).strip()
 
-    # Case 1: Already correct format
     try:
         return datetime.strptime(expiry_str, "%Y-%m-%d").strftime("%Y-%m-%d")
     except:
         pass
 
-    # Case 2: "10 Apr"
     try:
         year = datetime.now().year
         dt = datetime.strptime(f"{expiry_str} {year}", "%d %b %Y")
@@ -72,18 +66,16 @@ def _expiry_fmt(expiry_str: str) -> str:
     except:
         pass
 
-    # Case 3: "10 Apr 2026"
     try:
         dt = datetime.strptime(expiry_str, "%d %b %Y")
         return dt.strftime("%Y-%m-%d")
     except:
         pass
 
-    print("⚠️ Unknown expiry format:", expiry_str)
     return expiry_str
 
 
-# ─── SECURITY ID LOOKUP (FIXED) ───────────────────────────────────────────────
+# ─── SECURITY ID LOOKUP ───────────────────────────────────────────────────────
 def get_security_id(index: str, strike: int, expiry_str: str, cp: str) -> str:
 
     strike = int(float(strike))
@@ -98,19 +90,17 @@ def get_security_id(index: str, strike: int, expiry_str: str, cp: str) -> str:
 
     exchange   = "NSE_FO" if index == "NIFTY" else "BSE_FO"
     underlying = "NIFTY" if index == "NIFTY" else "SENSEX"
-    opt_type   = cp
 
     mask = (
         (df["SEM_EXM_EXCH_ID"] == exchange) &
         (df["SEM_TRADING_SYMBOL"].str.contains(underlying, na=False)) &
         (df["SEM_STRIKE_PRICE"].astype(float) == float(strike)) &
-        (df["SEM_OPTION_TYPE"] == opt_type) &
+        (df["SEM_OPTION_TYPE"] == cp) &
         (df["SEM_EXPIRY_DATE"].astype(str).str.contains(expiry_fmt))
     )
 
     result = df[mask]
 
-    # ✅ FIX: NO CRASH
     if result.empty:
         st.error(f"❌ No contract found: {index} {strike} {expiry_str} {cp}")
         st.stop()
@@ -197,3 +187,31 @@ def _get_candles(index, strike, expiry, cp, interval="1"):
         "close": d["close"],
         "volume": d.get("volume", [0]*len(d["open"]))
     })
+
+
+# ─── SPREAD OHLCV ─────────────────────────────────────────────────────────────
+def get_live_spread_ohlcv(legs: list, interval: str = "1") -> pd.DataFrame:
+    spread_close = None
+    base_df = None
+
+    for leg in legs:
+        df = _get_candles(
+            leg["index"], leg["strike"], leg["expiry"], leg["cp"], interval
+        )
+        price = df.set_index("time")["close"] * leg["ratio"]
+        price = price if leg["bs"] == "Buy" else -price
+
+        if spread_close is None:
+            spread_close = price
+            base_df = df
+        else:
+            spread_close = spread_close.add(price, fill_value=0)
+
+    out = pd.DataFrame()
+    out["time"] = base_df["time"].values
+    out["close"] = spread_close.values
+    out["open"] = out["close"].shift(1).fillna(out["close"])
+    out["high"] = out[["open", "close"]].max(axis=1)
+    out["low"] = out[["open", "close"]].min(axis=1)
+
+    return out.reset_index(drop=True)
