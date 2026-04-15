@@ -1,68 +1,95 @@
-"""data_helpers.py — All live data via Dhan API"""
+"""
+data_helpers.py
+Clean data layer — validates inputs, wraps API calls with proper errors.
+All functions here guarantee:
+  - Inputs validated before any API call
+  - Clear error messages raised on failure
+  - No silent fallbacks to bad data
+"""
+
 import pandas as pd
 from datetime import datetime
+
 from dhan_client import (
-    get_live_ltp, get_live_bid_ask_ltp, get_live_spread_ohlcv,
-    get_iv_series_live, get_multiplier_series_live,
-    get_expiries, get_strikes, get_spot_price,
-    get_spread_greeks, get_live_quote,
-    bs_price, implied_volatility, bs_greeks,
-    _days_to_expiry, RISK_FREE_RATE
+    get_expiries,
+    get_strikes,
+    get_live_ltp,
+    get_live_bid_ask_ltp,
+    get_live_quote,
+    get_live_spread_ohlcv,
+    get_iv_series_live,
+    get_multiplier_series_live,
+    get_spot_price,
+    get_spread_greeks,
+    validate_legs,
+    bs_price,
+    implied_volatility,
+    bs_greeks,
+    _days_to_expiry,
+    RISK_FREE_RATE,
 )
 
 TF_MAP = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "1D": 375}
 
-def get_nifty_expiries():
-    return get_expiries("NIFTY")
+# ─── Expiries / strikes ───────────────────────────────────────────────────────
 
-def get_sensex_expiries():
-    return get_expiries("SENSEX")
-
-def get_banknifty_expiries():
-    return get_expiries("BANKNIFTY")
-
-def get_index_expiries(index: str):
+def get_index_expiries(index: str) -> list:
+    """Returns live expiry list from Dhan. Raises on failure."""
     return get_expiries(index)
 
-def get_nifty_strikes(expiry):
-    return get_strikes("NIFTY", expiry)
-
-def get_sensex_strikes(expiry):
-    return get_strikes("SENSEX", expiry)
-
-def get_banknifty_strikes(expiry):
-    return get_strikes("BANKNIFTY", expiry)
-
-def get_index_strikes(index: str, expiry: str):
+def get_index_strikes(index: str, expiry: str) -> list:
+    """Returns live strike list from Dhan. Raises on failure."""
     return get_strikes(index, expiry)
 
-def get_option_price(index, strike, expiry, cp):
+# Convenience aliases
+get_nifty_expiries    = lambda: get_expiries("NIFTY")
+get_sensex_expiries   = lambda: get_expiries("SENSEX")
+get_banknifty_expiries= lambda: get_expiries("BANKNIFTY")
+get_nifty_strikes     = lambda exp: get_strikes("NIFTY", exp)
+get_sensex_strikes    = lambda exp: get_strikes("SENSEX", exp)
+get_banknifty_strikes = lambda exp: get_strikes("BANKNIFTY", exp)
+
+# ─── Option price ─────────────────────────────────────────────────────────────
+
+def get_option_price(index: str, strike: int, expiry: str, cp: str) -> float:
+    """Live LTP. Raises ValueError if inputs invalid or API fails."""
     return get_live_ltp(index, strike, expiry, cp)
 
-def get_spread_bid_ask_ltp(legs, strikes_per_leg):
-    bid_total = ask_total = ltp_total = 0.0
-    for leg, strike in zip(legs, strikes_per_leg):
-        bid, ask, ltp = get_live_bid_ask_ltp(leg["index"], strike, leg["expiry"], leg["cp"])
-        sign = 1 if leg["bs"] == "Buy" else -1
-        bid_total += sign * bid * leg["ratio"]
-        ask_total += sign * ask * leg["ratio"]
-        ltp_total += sign * ltp * leg["ratio"]
-    return round(bid_total,2), round(ask_total,2), round(ltp_total,2)
+# ─── Spread OHLCV ─────────────────────────────────────────────────────────────
 
-def generate_spread_ohlcv(legs, tf_minutes=1):
-    tf_map = {1:"1",5:"5",15:"15",60:"60",375:"D"}
-    return get_live_spread_ohlcv(legs, tf_map.get(tf_minutes,"1"))
+def generate_spread_ohlcv(legs: list, tf_minutes: int = 1) -> pd.DataFrame:
+    """
+    Live spread OHLCV. Validates ALL legs before any API call.
+    Raises ValueError with a clear message if any leg is invalid.
+    """
+    validate_legs(legs)  # raises before any API call if invalid
+    tf_map = {1: "1", 5: "5", 15: "15", 60: "60", 375: "D"}
+    return get_live_spread_ohlcv(legs, tf_map.get(tf_minutes, "1"))
 
-def get_iv_series(index, strike, expiry, cp, n_bars=60, tf_minutes=5):
-    return get_iv_series_live(index, strike, expiry, cp, tf_minutes)
+# ─── Greeks ───────────────────────────────────────────────────────────────────
 
-def get_multiplier_series(sx_strike, sx_expiry, n_strike, n_expiry, n_bars=80, tf_minutes=1):
-    tf_map = {1:"1",5:"5",15:"15",60:"60",375:"D"}
-    return get_multiplier_series_live(sx_strike, sx_expiry, n_strike, n_expiry, tf_map.get(tf_minutes,"1"))
-
-def calc_greeks_for_legs(legs):
+def calc_greeks_for_legs(legs: list) -> dict:
+    """Calculate net B-S Greeks for a list of legs."""
+    validate_legs(legs)
     spots = {}
     for leg in legs:
         if leg["index"] not in spots:
             spots[leg["index"]] = get_spot_price(leg["index"])
     return get_spread_greeks(legs, spots)
+
+# ─── IV series ────────────────────────────────────────────────────────────────
+
+def get_iv_series(index: str, strike: int, expiry: str, cp: str,
+                  n_bars: int = 60, tf_minutes: int = 5) -> pd.DataFrame:
+    return get_iv_series_live(index, strike, expiry, cp, tf_minutes)
+
+# ─── Multiplier ───────────────────────────────────────────────────────────────
+
+def get_multiplier_series(sx_strike: int, sx_expiry: str,
+                           n_strike:  int, n_expiry:  str,
+                           n_bars: int = 80, tf_minutes: int = 1) -> pd.DataFrame:
+    tf_map = {1: "1", 5: "5", 15: "15", 60: "60", 375: "D"}
+    return get_multiplier_series_live(
+        sx_strike, sx_expiry, n_strike, n_expiry,
+        tf_map.get(tf_minutes, "1")
+    )
