@@ -64,16 +64,34 @@ def _b64(val) -> str:
 # TOKEN GENERATION  (TOTP auto-login — same as your friend's code)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _safe_json(response, step: str):
+    """Parse JSON safely — raise a clear error if response is empty/HTML."""
+    raw = response.text.strip()
+    if not raw:
+        raise ValueError(
+            f"Fyers API returned empty response at {step}. "
+            f"HTTP {response.status_code}. This usually means the API endpoint "
+            f"is temporarily down or your IP is rate-limited. Try again in 30 seconds."
+        )
+    try:
+        return response.json()
+    except Exception:
+        preview = raw[:200]
+        raise ValueError(
+            f"Fyers API returned non-JSON at {step} (HTTP {response.status_code}): {preview}"
+        )
+
+
 def _generate_token() -> tuple:
     """
-    Fully automated Fyers login via TOTP.
+    Automated Fyers login via TOTP.
     Returns (access_token, None) on success, (None, error_message) on failure.
     """
-    client_id   = _secret("FYERS_CLIENT_ID")
-    secret_key  = _secret("FYERS_SECRET_KEY")
-    username    = _secret("FYERS_USERNAME")
-    pin         = _secret("FYERS_PIN")
-    totp_key    = _secret("FYERS_TOTP_KEY")
+    client_id    = _secret("FYERS_CLIENT_ID")
+    secret_key   = _secret("FYERS_SECRET_KEY")
+    username     = _secret("FYERS_USERNAME")
+    pin          = _secret("FYERS_PIN")
+    totp_key     = _secret("FYERS_TOTP_KEY")
     redirect_uri = "http://127.0.0.1:8080/"
 
     missing = [k for k, v in {
@@ -85,62 +103,84 @@ def _generate_token() -> tuple:
         return None, f"Missing Fyers secrets: {', '.join(missing)}"
 
     try:
-        s  = _requests.Session()
+        s = _requests.Session()
+        s.headers.update({
+            "Content-Type": "application/json",
+            "Accept":       "application/json",
+            "User-Agent":   "python-requests/2.31.0",
+        })
 
         # Step 1 — send OTP
-        r1 = s.post("https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
-                    json={"fy_id": _b64(username), "app_id": "2"}, timeout=10)
-        r1d = r1.json()
+        r1 = s.post(
+            "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
+            json={"fy_id": _b64(username), "app_id": "2"},
+            timeout=15)
+        r1d = _safe_json(r1, "Step1/send_otp")
         if r1d.get("s") != "ok":
             return None, f"Step 1 failed: {r1d}"
 
         # Step 2 — verify TOTP
         totp_code = pyotp.TOTP(totp_key).now()
-        r2 = s.post("https://api-t2.fyers.in/vagator/v2/verify_otp",
-                    json={"request_key": r1d["request_key"], "otp": totp_code}, timeout=10)
-        r2d = r2.json()
+        r2 = s.post(
+            "https://api-t2.fyers.in/vagator/v2/verify_otp",
+            json={"request_key": r1d["request_key"], "otp": totp_code},
+            timeout=15)
+        r2d = _safe_json(r2, "Step2/verify_otp")
         if r2d.get("s") != "ok":
-            return None, f"Step 2 failed: {r2d}"
+            return None, (
+                f"Step 2 (TOTP verify) failed: {r2d}. "
+                f"Check FYERS_TOTP_KEY — it must be the Base32 secret from your "
+                f"authenticator app setup, NOT the 6-digit code."
+            )
 
         # Step 3 — verify PIN
-        r3 = s.post("https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
-                    json={"request_key": r2d["request_key"],
-                          "identity_type": "pin", "identifier": _b64(pin)}, timeout=10)
-        r3d = r3.json()
+        r3 = s.post(
+            "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
+            json={"request_key": r2d["request_key"],
+                  "identity_type": "pin", "identifier": _b64(pin)},
+            timeout=15)
+        r3d = _safe_json(r3, "Step3/verify_pin")
         if r3d.get("s") != "ok":
-            return None, f"Step 3 failed: {r3d}"
+            return None, f"Step 3 (PIN verify) failed: {r3d}. Check FYERS_PIN."
 
         # Step 4 — get auth code
         app_id = client_id.split("-")[0]
-        r4 = s.post("https://api-t1.fyers.in/api/v3/token", json={
-            "fyers_id": username, "app_id": app_id,
-            "redirect_uri": redirect_uri, "appType": "100",
-            "code_challenge": "", "state": "sample",
-            "scope": "", "nonce": "", "response_type": "code", "create_cookie": True
-        }, headers={"Authorization": f"Bearer {r3d['data']['access_token']}"}, timeout=10)
-        r4d = r4.json()
+        r4 = s.post(
+            "https://api-t1.fyers.in/api/v3/token",
+            json={
+                "fyers_id": username, "app_id": app_id,
+                "redirect_uri": redirect_uri, "appType": "100",
+                "code_challenge": "", "state": "sample",
+                "scope": "", "nonce": "", "response_type": "code",
+                "create_cookie": True,
+            },
+            headers={"Authorization": f"Bearer {r3d['data']['access_token']}"},
+            timeout=15)
+        r4d = _safe_json(r4, "Step4/get_auth_code")
         if r4d.get("s") != "ok":
-            return None, f"Step 4 failed: {r4d}"
+            return None, f"Step 4 (auth code) failed: {r4d}"
 
         auth_code = parse_qs(urlparse(r4d["Url"]).query).get("auth_code", [None])[0]
         if not auth_code:
-            return None, f"No auth_code in: {r4d}"
+            return None, f"No auth_code in URL: {r4d.get('Url','')}"
 
         # Step 5 — exchange for access token
         session = fyersModel.SessionModel(
             client_id=client_id, secret_key=secret_key,
             redirect_uri=redirect_uri, response_type="code",
-            grant_type="authorization_code"
+            grant_type="authorization_code",
         )
         session.set_token(auth_code)
         r5d   = session.generate_token()
         token = r5d.get("access_token")
         if not token:
-            return None, f"Step 5 failed: {r5d}"
+            return None, f"Step 5 (token exchange) failed: {r5d}"
         return token, None
 
+    except ValueError as e:
+        return None, str(e)
     except Exception as e:
-        return None, f"Exception during Fyers login: {e}"
+        return None, f"Exception during Fyers login: {type(e).__name__}: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,24 +190,38 @@ def _generate_token() -> tuple:
 @st.cache_resource
 def _get_shared_token() -> str:
     """
-    Generates/loads Fyers token once — shared across all sessions on this server.
-    Cached until explicitly cleared with _get_shared_token.clear()
+    Loads/generates Fyers access token. Priority order:
+      1. FYERS_ACCESS_TOKEN secret  (paste directly from Fyers dashboard — easiest)
+      2. fyers_token.txt file       (local PC manual token)
+      3. Auto-login via TOTP        (fully automated but requires all 5 secrets)
     """
-    # Try saved token file first (useful on local PC)
+    # ── Option 1: direct access token in secrets (highest priority) ──────────
+    direct_token = _secret("FYERS_ACCESS_TOKEN")
+    if direct_token and len(direct_token) > 20:
+        return direct_token
+
+    # ── Option 2: token file on disk (local PC) ───────────────────────────────
     token_file = "fyers_token.txt"
     try:
         with open(token_file) as f:
             tok = f.read().strip()
-        if tok:
+        if tok and len(tok) > 20:
             return tok
     except FileNotFoundError:
         pass
 
-    # Auto-generate via TOTP
+    # ── Option 3: auto-generate via TOTP ─────────────────────────────────────
     token, error = _generate_token()
     if token:
         return token
-    raise RuntimeError(f"Fyers login failed: {error}")
+    raise RuntimeError(
+        f"Fyers authentication failed: {error}\n\n"
+        f"Fix options (use any ONE):\n"
+        f"1. Add FYERS_ACCESS_TOKEN to Streamlit secrets "
+        f"(get it from Fyers API dashboard → Apps → your app → Generate Token)\n"
+        f"2. Add all 5 TOTP secrets: FYERS_CLIENT_ID, FYERS_SECRET_KEY, "
+        f"FYERS_USERNAME, FYERS_PIN, FYERS_TOTP_KEY"
+    )
 
 
 def get_fyers_client() -> fyersModel.FyersModel:
