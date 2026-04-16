@@ -43,6 +43,10 @@ _UNDERLYING_SYM = {
 }
 _MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 
+# ─── Redirect URI — must match exactly what is set in Fyers API dashboard ────
+# Go to: myapi.fyers.in → Apps → your app → Edit → set Redirect URL to this:
+REDIRECT_URI = "https://trade.fyers.in/api-login/redirect-uri/index.html"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECRETS HELPER
@@ -61,7 +65,7 @@ def _b64(val) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOKEN GENERATION  (TOTP auto-login — same as your friend's code)
+# TOKEN GENERATION  (TOTP auto-login)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe_json(response, step: str):
@@ -87,12 +91,11 @@ def _generate_token() -> tuple:
     Automated Fyers login via TOTP.
     Returns (access_token, None) on success, (None, error_message) on failure.
     """
-    client_id    = _secret("FYERS_CLIENT_ID")
-    secret_key   = _secret("FYERS_SECRET_KEY")
-    username     = _secret("FYERS_USERNAME")
-    pin          = _secret("FYERS_PIN")
-    totp_key     = _secret("FYERS_TOTP_KEY")
-    redirect_uri = "http://127.0.0.1:8080/"
+    client_id  = _secret("FYERS_CLIENT_ID")
+    secret_key = _secret("FYERS_SECRET_KEY")
+    username   = _secret("FYERS_USERNAME")
+    pin        = _secret("FYERS_PIN")
+    totp_key   = _secret("FYERS_TOTP_KEY")
 
     missing = [k for k, v in {
         "FYERS_CLIENT_ID": client_id, "FYERS_SECRET_KEY": secret_key,
@@ -149,7 +152,7 @@ def _generate_token() -> tuple:
             "https://api-t1.fyers.in/api/v3/token",
             json={
                 "fyers_id": username, "app_id": app_id,
-                "redirect_uri": redirect_uri, "appType": "100",
+                "redirect_uri": REDIRECT_URI, "appType": "100",
                 "code_challenge": "", "state": "sample",
                 "scope": "", "nonce": "", "response_type": "code",
                 "create_cookie": True,
@@ -167,7 +170,7 @@ def _generate_token() -> tuple:
         # Step 5 — exchange for access token
         session = fyersModel.SessionModel(
             client_id=client_id, secret_key=secret_key,
-            redirect_uri=redirect_uri, response_type="code",
+            redirect_uri=REDIRECT_URI, response_type="code",
             grant_type="authorization_code",
         )
         session.set_token(auth_code)
@@ -220,7 +223,9 @@ def _get_shared_token() -> str:
         f"1. Add FYERS_ACCESS_TOKEN to Streamlit secrets "
         f"(get it from Fyers API dashboard → Apps → your app → Generate Token)\n"
         f"2. Add all 5 TOTP secrets: FYERS_CLIENT_ID, FYERS_SECRET_KEY, "
-        f"FYERS_USERNAME, FYERS_PIN, FYERS_TOTP_KEY"
+        f"FYERS_USERNAME, FYERS_PIN, FYERS_TOTP_KEY\n\n"
+        f"Also ensure your Fyers app's Redirect URL is set to:\n"
+        f"{REDIRECT_URI}"
     )
 
 
