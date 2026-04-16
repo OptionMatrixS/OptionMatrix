@@ -43,9 +43,9 @@ _UNDERLYING_SYM = {
 }
 _MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 
-# ─── Redirect URI — must match exactly what is set in Fyers API dashboard ────
-# Go to: myapi.fyers.in → Apps → your app → Edit → set Redirect URL to this:
-REDIRECT_URI = "https://trade.fyers.in/api-login/redirect-uri/index.html"
+# Redirect URI — must exactly match what is set in your Fyers API app dashboard
+# Go to myapi.fyers.in → Apps → your app → Edit → set Redirect URL to:
+REDIRECT_URI = "http://127.0.0.1:8080/"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,7 +65,7 @@ def _b64(val) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOKEN GENERATION  (TOTP auto-login)
+# TOKEN GENERATION  (TOTP auto-login — same as your friend's code)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe_json(response, step: str):
@@ -90,6 +90,7 @@ def _generate_token() -> tuple:
     """
     Automated Fyers login via TOTP.
     Returns (access_token, None) on success, (None, error_message) on failure.
+    Uses same flow as proven working dashboard code.
     """
     client_id  = _secret("FYERS_CLIENT_ID")
     secret_key = _secret("FYERS_SECRET_KEY")
@@ -105,79 +106,83 @@ def _generate_token() -> tuple:
     if missing:
         return None, f"Missing Fyers secrets: {', '.join(missing)}"
 
+    import hashlib
     try:
         s = _requests.Session()
-        s.headers.update({
-            "Content-Type": "application/json",
-            "Accept":       "application/json",
-            "User-Agent":   "python-requests/2.31.0",
-        })
 
         # Step 1 — send OTP
-        r1 = s.post(
-            "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
-            json={"fy_id": _b64(username), "app_id": "2"},
-            timeout=15)
+        r1 = s.post("https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
+                    json={"fy_id": _b64(username), "app_id": "2"}, timeout=10)
+        if r1.status_code == 429:
+            return None, "Rate limited by Fyers (429). Wait ~60 seconds then click Refresh Token."
         r1d = _safe_json(r1, "Step1/send_otp")
         if r1d.get("s") != "ok":
             return None, f"Step 1 failed: {r1d}"
 
         # Step 2 — verify TOTP
         totp_code = pyotp.TOTP(totp_key).now()
-        r2 = s.post(
-            "https://api-t2.fyers.in/vagator/v2/verify_otp",
-            json={"request_key": r1d["request_key"], "otp": totp_code},
-            timeout=15)
+        r2 = s.post("https://api-t2.fyers.in/vagator/v2/verify_otp",
+                    json={"request_key": r1d["request_key"], "otp": totp_code}, timeout=10)
         r2d = _safe_json(r2, "Step2/verify_otp")
         if r2d.get("s") != "ok":
             return None, (
                 f"Step 2 (TOTP verify) failed: {r2d}. "
-                f"Check FYERS_TOTP_KEY — it must be the Base32 secret from your "
-                f"authenticator app setup, NOT the 6-digit code."
+                f"FYERS_TOTP_KEY must be the Base32 secret, NOT the 6-digit code."
             )
 
         # Step 3 — verify PIN
-        r3 = s.post(
-            "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
-            json={"request_key": r2d["request_key"],
-                  "identity_type": "pin", "identifier": _b64(pin)},
-            timeout=15)
+        r3 = s.post("https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
+                    json={"request_key": r2d["request_key"],
+                          "identity_type": "pin", "identifier": _b64(pin)}, timeout=10)
         r3d = _safe_json(r3, "Step3/verify_pin")
         if r3d.get("s") != "ok":
             return None, f"Step 3 (PIN verify) failed: {r3d}. Check FYERS_PIN."
 
         # Step 4 — get auth code
         app_id = client_id.split("-")[0]
-        r4 = s.post(
-            "https://api-t1.fyers.in/api/v3/token",
-            json={
-                "fyers_id": username, "app_id": app_id,
-                "redirect_uri": REDIRECT_URI, "appType": "100",
-                "code_challenge": "", "state": "sample",
-                "scope": "", "nonce": "", "response_type": "code",
-                "create_cookie": True,
-            },
-            headers={"Authorization": f"Bearer {r3d['data']['access_token']}"},
-            timeout=15)
+        r4 = s.post("https://api-t1.fyers.in/api/v3/token", json={
+            "fyers_id": username, "app_id": app_id,
+            "redirect_uri": REDIRECT_URI, "appType": "100",
+            "code_challenge": "", "state": "sample",
+            "scope": "", "nonce": "", "response_type": "code", "create_cookie": True
+        }, headers={"Authorization": f"Bearer {r3d['data']['access_token']}"}, timeout=10)
         r4d = _safe_json(r4, "Step4/get_auth_code")
         if r4d.get("s") != "ok":
             return None, f"Step 4 (auth code) failed: {r4d}"
 
-        auth_code = parse_qs(urlparse(r4d["Url"]).query).get("auth_code", [None])[0]
-        if not auth_code:
-            return None, f"No auth_code in URL: {r4d.get('Url','')}"
-
-        # Step 5 — exchange for access token
-        session = fyersModel.SessionModel(
-            client_id=client_id, secret_key=secret_key,
-            redirect_uri=REDIRECT_URI, response_type="code",
-            grant_type="authorization_code",
+        # Extract auth_code — try multiple locations in response
+        data = r4d.get("data", {})
+        auth_code = (
+            data.get("auth")
+            or parse_qs(urlparse(r4d.get("Url", "")).query).get("auth_code", [None])[0]
+            or parse_qs(urlparse(data.get("url", "")).query).get("auth_code", [None])[0]
         )
-        session.set_token(auth_code)
-        r5d   = session.generate_token()
+        if not auth_code:
+            return None, f"Step 4: no auth_code in response: {r4d}"
+
+        # Step 5 — exchange auth_code via validate-authcode (new Fyers API, SHA-256 hash)
+        app_id_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
+        r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
+            "grant_type": "authorization_code",
+            "appIdHash":  app_id_hash,
+            "code":       auth_code,
+        }, timeout=10)
+        r5d   = _safe_json(r5, "Step5/validate-authcode")
         token = r5d.get("access_token")
+
         if not token:
-            return None, f"Step 5 (token exchange) failed: {r5d}"
+            # Fallback: legacy SDK token exchange
+            session = fyersModel.SessionModel(
+                client_id=client_id, secret_key=secret_key,
+                redirect_uri=REDIRECT_URI, response_type="code",
+                grant_type="authorization_code",
+            )
+            session.set_token(auth_code)
+            r5d_legacy = session.generate_token()
+            token = r5d_legacy.get("access_token")
+            if not token:
+                return None, f"Step 5 failed (both methods): validate-authcode={r5d}, legacy={r5d_legacy}"
+
         return token, None
 
     except ValueError as e:
@@ -191,41 +196,72 @@ def _generate_token() -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def _get_shared_token() -> str:
+def _cached_token(client_id, secret_key, username, pin, totp_key) -> tuple:
     """
-    Loads/generates Fyers access token. Priority order:
-      1. FYERS_ACCESS_TOKEN secret  (paste directly from Fyers dashboard — easiest)
-      2. fyers_token.txt file       (local PC manual token)
-      3. Auto-login via TOTP        (fully automated but requires all 5 secrets)
+    Cached TOTP token generator. Credentials passed explicitly so st.secrets
+    is read in normal Streamlit context — not inside the cache thread.
+    Caches result so TOTP login only runs once per server restart.
     """
-    # ── Option 1: direct access token in secrets (highest priority) ──────────
-    direct_token = _secret("FYERS_ACCESS_TOKEN")
-    if direct_token and len(direct_token) > 20:
-        return direct_token
-
-    # ── Option 2: token file on disk (local PC) ───────────────────────────────
     token_file = "fyers_token.txt"
     try:
         with open(token_file) as f:
             tok = f.read().strip()
         if tok and len(tok) > 20:
-            return tok
+            return tok, None
     except FileNotFoundError:
         pass
-
-    # ── Option 3: auto-generate via TOTP ─────────────────────────────────────
     token, error = _generate_token()
+    if token:
+        try:
+            with open(token_file, "w") as f:
+                f.write(token)
+        except Exception:
+            pass
+        return token, None
+    return None, error
+
+
+def _get_shared_token() -> str:
+    """
+    Loads/generates Fyers access token. Priority order:
+      1. FYERS_ACCESS_TOKEN in secrets  — paste from Fyers dashboard (easiest)
+      2. fyers_token.txt on disk        — local PC
+      3. Auto TOTP login                — requires all 5 TOTP secrets
+    Reads st.secrets here (normal Streamlit context) then passes
+    to cached function — same pattern as friend's working dashboard.
+    """
+    # Option 1: direct token
+    direct_token = _secret("FYERS_ACCESS_TOKEN")
+    if direct_token and len(direct_token) > 20:
+        return direct_token
+
+    # Option 2+3: TOTP flow
+    client_id  = _secret("FYERS_CLIENT_ID")
+    secret_key = _secret("FYERS_SECRET_KEY")
+    username   = _secret("FYERS_USERNAME")
+    pin        = _secret("FYERS_PIN")
+    totp_key   = _secret("FYERS_TOTP_KEY")
+
+    missing = [k for k, v in {
+        "FYERS_CLIENT_ID": client_id, "FYERS_SECRET_KEY": secret_key,
+        "FYERS_USERNAME": username, "FYERS_PIN": pin, "FYERS_TOTP_KEY": totp_key,
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(
+            f"Missing Fyers credentials: {', '.join(missing)}. "
+            f"Add FYERS_ACCESS_TOKEN (easiest) or all 5 TOTP secrets to Streamlit secrets."
+        )
+
+    token, error = _cached_token(client_id, secret_key, username, pin, totp_key)
     if token:
         return token
     raise RuntimeError(
         f"Fyers authentication failed: {error}\n\n"
-        f"Fix options (use any ONE):\n"
+        f"Fix options:\n"
         f"1. Add FYERS_ACCESS_TOKEN to Streamlit secrets "
-        f"(get it from Fyers API dashboard → Apps → your app → Generate Token)\n"
-        f"2. Add all 5 TOTP secrets: FYERS_CLIENT_ID, FYERS_SECRET_KEY, "
-        f"FYERS_USERNAME, FYERS_PIN, FYERS_TOTP_KEY\n\n"
-        f"Also ensure your Fyers app's Redirect URL is set to:\n"
-        f"{REDIRECT_URI}"
+        f"(get from myapi.fyers.in → Apps → your app → Generate Token)\n"
+        f"2. Check all 5 TOTP secrets are correct\n"
+        f"3. Ensure Fyers app Redirect URL = {REDIRECT_URI}"
     )
 
 
@@ -241,9 +277,14 @@ def get_fyers_client() -> fyersModel.FyersModel:
 
 def refresh_token():
     """Force re-authentication. Call when token has expired."""
-    _get_shared_token.clear()
+    _cached_token.clear()
     st.session_state.pop("fyers_client", None)
-    st.session_state.pop("fyers_expiries", None)
+    # Delete saved token file so next login generates fresh token
+    import os as _os
+    try:
+        _os.remove("fyers_token.txt")
+    except FileNotFoundError:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
