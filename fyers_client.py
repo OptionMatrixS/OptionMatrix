@@ -3,6 +3,8 @@ import requests
 import pyotp
 import base64
 from fyers_apiv3 import fyersModel
+import pandas as pd
+from datetime import datetime
 
 # ==============================
 # 🔐 SECRETS
@@ -37,9 +39,8 @@ def generate_token():
         raise Exception("Rate limited. Wait 2–5 minutes and restart app.")
 
     r1 = r1.json()
-
     if "request_key" not in r1:
-        raise Exception(f"OTP Step Failed: {r1}")
+        raise Exception(f"OTP Failed: {r1}")
 
     # STEP 2: VERIFY TOTP
     otp = pyotp.TOTP(TOTP_KEY).now()
@@ -127,7 +128,8 @@ def get_expiries(index):
 
     symbol_map = {
         "NIFTY": "NSE:NIFTY50-INDEX",
-        "SENSEX": "BSE:SENSEX-INDEX"
+        "SENSEX": "BSE:SENSEX-INDEX",
+        "BANKNIFTY": "NSE:NIFTYBANK-INDEX"
     }
 
     if index not in symbol_map:
@@ -141,12 +143,89 @@ def get_expiries(index):
     if response.get("s") != "ok":
         raise Exception(f"API Error: {response}")
 
-    expiry_data = response.get("data", {}).get("expiryData", [])
+    return response["data"]["expiryData"]
 
-    if not expiry_data:
-        raise Exception("No expiry data received")
+# ==============================
+# 📈 STRIKES
+# ==============================
 
-    return expiry_data
+@st.cache_data(ttl=300)
+def get_strikes(index):
+    fyers = get_fyers()
+
+    symbol_map = {
+        "NIFTY": "NSE:NIFTY50-INDEX",
+        "SENSEX": "BSE:SENSEX-INDEX",
+        "BANKNIFTY": "NSE:NIFTYBANK-INDEX"
+    }
+
+    response = fyers.optionchain({
+        "symbol": symbol_map[index],
+        "strikecount": 50
+    })
+
+    options = response.get("data", {}).get("optionsChain", [])
+
+    strikes = set()
+    for opt in options:
+        try:
+            strikes.add(int(opt["strikePrice"]))
+        except:
+            pass
+
+    return sorted(list(strikes))
+
+# ==============================
+# 💰 LIVE QUOTE
+# ==============================
+
+def get_live_quote(symbol):
+    fyers = get_fyers()
+    return fyers.quotes({"symbols": symbol})
+
+# ==============================
+# 📊 SPOT PRICE
+# ==============================
+
+def get_spot_price(index):
+    fyers = get_fyers()
+
+    symbol_map = {
+        "NIFTY": "NSE:NIFTY50-INDEX",
+        "SENSEX": "BSE:SENSEX-INDEX",
+        "BANKNIFTY": "NSE:NIFTYBANK-INDEX"
+    }
+
+    response = fyers.quotes({"symbols": symbol_map[index]})
+
+    return response["d"][0]["v"]["lp"]
+
+# ==============================
+# 📉 CANDLES (OPTION DATA)
+# ==============================
+
+def get_candles(symbol, interval=1):
+    fyers = get_fyers()
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    response = fyers.history({
+        "symbol": symbol,
+        "resolution": str(interval),
+        "date_format": "1",
+        "range_from": today,
+        "range_to": today,
+        "cont_flag": "1"
+    })
+
+    if response.get("s") != "ok":
+        return pd.DataFrame()
+
+    df = pd.DataFrame(response["candles"],
+                      columns=["ts", "open", "high", "low", "close", "volume"])
+
+    df["time"] = pd.to_datetime(df["ts"], unit="s")
+    return df.set_index("time")
 
 # ==============================
 # 🧪 TEST CONNECTION
