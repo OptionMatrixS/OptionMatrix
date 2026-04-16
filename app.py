@@ -107,14 +107,41 @@ with st.sidebar:
                  help="Re-authenticate with Fyers (use when token expires)"):
         from fyers_client import refresh_token
         refresh_token()
-        # Clear cached expiries/strikes so they reload with new token
-        keys_to_clear = [k for k in st.session_state.keys()
+        keys_to_clear = [k for k in list(st.session_state.keys())
                          if k.startswith("expiries_") or k.startswith("strikes_")
-                         or k in ("fyers_client","fyers_expiries")]
+                         or k in ("fyers_client",)]
         for k in keys_to_clear:
             del st.session_state[k]
         st.success("Token cleared — will re-authenticate on next action.")
         st.rerun()
+
+    # Show auth status
+    try:
+        from fyers_client import _secret
+        has_direct  = bool(_secret("FYERS_ACCESS_TOKEN"))
+        has_totp    = all([_secret(k) for k in
+                           ["FYERS_CLIENT_ID","FYERS_SECRET_KEY",
+                            "FYERS_USERNAME","FYERS_PIN","FYERS_TOTP_KEY"]])
+        if has_direct:
+            st.markdown(
+                '<div style="font-size:10px;color:#26a69a;padding:4px 8px;'
+                'background:#0d2b1f;border-radius:4px;margin-top:4px;'
+                'border:1px solid #26a69a40;">✓ Direct token configured</div>',
+                unsafe_allow_html=True)
+        elif has_totp:
+            st.markdown(
+                '<div style="font-size:10px;color:#ff9800;padding:4px 8px;'
+                'background:#2b1a0d;border-radius:4px;margin-top:4px;'
+                'border:1px solid #ff980040;">⚡ TOTP auto-login configured</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div style="font-size:10px;color:#ef5350;padding:4px 8px;'
+                'background:#2b0d0d;border-radius:4px;margin-top:4px;'
+                'border:1px solid #ef535040;">⚠ No Fyers credentials found</div>',
+                unsafe_allow_html=True)
+    except Exception:
+        pass
 
     if st.button("🚪  Logout", use_container_width=True, type="secondary"):
         # Clear only auth state — preserve user's work (charts, uploads etc)
