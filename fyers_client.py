@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import requests
 import pyotp
@@ -35,9 +34,12 @@ def generate_token():
     )
 
     if r1.status_code == 429:
-        raise Exception("Rate limited. Wait 2 minutes and restart app.")
+        raise Exception("Rate limited. Wait 2–5 minutes and restart app.")
 
     r1 = r1.json()
+
+    if "request_key" not in r1:
+        raise Exception(f"OTP Step Failed: {r1}")
 
     # STEP 2: VERIFY TOTP
     otp = pyotp.TOTP(TOTP_KEY).now()
@@ -46,6 +48,9 @@ def generate_token():
         "https://api-t2.fyers.in/vagator/v2/verify_otp",
         json={"request_key": r1["request_key"], "otp": otp}
     ).json()
+
+    if "request_key" not in r2:
+        raise Exception(f"TOTP Failed: {r2}")
 
     # STEP 3: VERIFY PIN
     r3 = session.post(
@@ -56,6 +61,9 @@ def generate_token():
             "identifier": b64(PIN)
         }
     ).json()
+
+    if "data" not in r3:
+        raise Exception(f"PIN Failed: {r3}")
 
     temp_token = r3["data"]["access_token"]
 
@@ -74,6 +82,9 @@ def generate_token():
         headers={"Authorization": f"Bearer {temp_token}"}
     ).json()
 
+    if "data" not in r4 or "auth_code" not in r4["data"]:
+        raise Exception(f"Auth Code Failed: {r4}")
+
     auth_code = r4["data"]["auth_code"]
 
     # STEP 5: FINAL TOKEN
@@ -87,6 +98,9 @@ def generate_token():
 
     session_model.set_token(auth_code)
     final = session_model.generate_token()
+
+    if "access_token" not in final:
+        raise Exception(f"Final Token Failed: {final}")
 
     return final["access_token"]
 
@@ -116,23 +130,28 @@ def get_expiries(index):
         "SENSEX": "BSE:SENSEX-INDEX"
     }
 
-    symbol = symbol_map[index]
+    if index not in symbol_map:
+        raise Exception(f"Invalid index: {index}")
 
     response = fyers.optionchain({
-        "symbol": symbol,
+        "symbol": symbol_map[index],
         "strikecount": 1
     })
 
     if response.get("s") != "ok":
-        raise Exception(response)
+        raise Exception(f"API Error: {response}")
 
-    return response["data"]["expiryData"]
+    expiry_data = response.get("data", {}).get("expiryData", [])
+
+    if not expiry_data:
+        raise Exception("No expiry data received")
+
+    return expiry_data
 
 # ==============================
-# 🧪 TEST
+# 🧪 TEST CONNECTION
 # ==============================
 
 def test_connection():
     fyers = get_fyers()
     return fyers.get_profile()
-```
