@@ -180,12 +180,26 @@ def render():
     with fc5:
         show_greeks = st.checkbox("Show Greeks", value=False, key="pos_greeks")
 
+    # Strike filter — shown after main row
+    strike_filter_vals = []
+    if "Strike Price" in df_raw.columns:
+        df_for_strikes = df_raw.copy()
+        if sel_ids and "ID" in df_for_strikes.columns:
+            df_for_strikes = df_for_strikes[df_for_strikes["ID"].isin(sel_ids)]
+        avail_strikes = sorted([int(x) for x in df_for_strikes["Strike Price"].dropna().unique() if x > 0])
+        if avail_strikes:
+            strike_filter_vals = st.multiselect(
+                "Strike Price", avail_strikes, default=avail_strikes, key="pos_strikes",
+                help="Filter by specific strike prices")
+
     # ── Apply filters ─────────────────────────────────────────────────────────
     df = df_raw.copy()
     if sel_ids    and "ID"          in df.columns: df = df[df["ID"].isin(sel_ids)]
     if sel_und    and "Underlying"  in df.columns: df = df[df["Underlying"].isin(sel_und)]
     if sel_type   and "Scrip Type"  in df.columns: df = df[df["Scrip Type"].isin(sel_type)]
     if sel_expiries and "Expiry Date" in df.columns: df = df[df["Expiry Date"].isin(sel_expiries)]
+    if strike_filter_vals and "Strike Price" in df.columns:
+        df = df[df["Strike Price"].isin(strike_filter_vals)]
 
     sort_cols = [c for c in ["Underlying", "Expiry Date", "Strike Price"] if c in df.columns]
     if sort_cols: df = df.sort_values(sort_cols)
@@ -292,14 +306,45 @@ def render():
 
             row_cols[ci+1].markdown(cell_md, unsafe_allow_html=True)
 
-    # ── Totals row ────────────────────────────────────────────────────────────
+    # ── Totals row with BEP ──────────────────────────────────────────────────
+    try:
+        net_cf_total = df["Net Position CF"].sum() if "Net Position CF" in df.columns else 0
+        net_pos_total = df["Net Position"].sum() if "Net Position" in df.columns else 0
+        # Weighted average BEP
+        if "BEP" in df.columns and "Net Position" in df.columns:
+            weights = df["Net Position"].abs()
+            w_sum   = weights.sum()
+            bep_total = (df["BEP"] * weights).sum() / w_sum if w_sum > 0 else 0
+            if net_cf_total < 0:
+                bep_total = -abs(bep_total)
+        else:
+            bep_total = 0
+        qty_total   = abs(net_pos_total) if net_pos_total != 0 else 1
+        bep_per_qty = round(bep_total / qty_total, 2) if qty_total else 0
+    except Exception:
+        bep_total = bep_per_qty = 0
+
     total_cols = st.columns([0.3] + [1]*len(cols_show))
     total_cols[0].markdown(
         f'<div style="font-size:10px;color:#2962ff;padding:5px 0;'
         f'border-top:2px solid #2962ff;text-align:center;">'
         f'{len(df)}</div>', unsafe_allow_html=True)
     for ci, col_name in enumerate(cols_show):
-        if col_name in NUMERIC_COLS:
+        if col_name == "ID":
+            total_cols[ci+1].markdown(
+                '<div style="font-size:11px;font-weight:700;color:#2962ff;'
+                'border-top:2px solid #2962ff;padding:5px 2px;">TOTAL</div>',
+                unsafe_allow_html=True)
+        elif col_name == "BEP":
+            clr = _color(bep_total)
+            total_cols[ci+1].markdown(
+                f'<div style="font-size:11px;font-weight:700;color:{clr};'
+                f'border-top:2px solid #2962ff;padding:5px 2px;'
+                f'font-family:\'JetBrains Mono\',monospace;text-align:right;">'
+                f'{_fmt(bep_total)}'
+                f'<br><span style="font-size:9px;color:#787b86;">÷qty: {_fmt(bep_per_qty)}</span></div>',
+                unsafe_allow_html=True)
+        elif col_name in NUMERIC_COLS:
             tot = df[col_name].sum() if col_name in df.columns else 0
             clr = _color(tot)
             total_cols[ci+1].markdown(
@@ -307,11 +352,6 @@ def render():
                 f'border-top:2px solid #2962ff;padding:5px 2px;'
                 f'font-family:\'JetBrains Mono\',monospace;text-align:right;">'
                 f'{_fmt(tot)}</div>', unsafe_allow_html=True)
-        elif col_name == "ID":
-            total_cols[ci+1].markdown(
-                '<div style="font-size:11px;font-weight:700;color:#2962ff;'
-                'border-top:2px solid #2962ff;padding:5px 2px;">TOTAL</div>',
-                unsafe_allow_html=True)
         else:
             total_cols[ci+1].markdown(
                 '<div style="border-top:2px solid #2962ff;padding:5px 2px;"></div>',
