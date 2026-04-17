@@ -60,14 +60,73 @@ def login_user(username: str, password: str) -> tuple:
     tools = [t.strip() for t in tools_str.split(",") if t.strip()]
     return True, {"username": uname, "role": role, "tools": tools}
 
+def get_all_users():
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT username, role, approved_tools FROM users ORDER BY username"
+    ).fetchall()
+    conn.close()
+    return rows
+
+def update_user_tools(username: str, tools: list):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET approved_tools=? WHERE username=?",
+              (",".join(tools), username))
+    conn.commit()
+    conn.close()
+
+def update_user_role(username: str, role: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET role=? WHERE username=?", (role, username))
+    conn.commit()
+    conn.close()
+
+def delete_user(username: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM users WHERE username=?", (username,))
+    conn.commit()
+    conn.close()
+
+def change_password(username: str, new_password: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET password=? WHERE username=?",
+              (_hash(new_password), username))
+    conn.commit()
+    conn.close()
+
+def upsert_user(username: str, password: str, role: str = "member",
+                approved: bool = True, tools: str = ""):
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    existing = c.execute(
+        "SELECT username FROM users WHERE username=?", (username,)).fetchone()
+    if existing:
+        c.execute("UPDATE users SET role=?,approved_tools=? WHERE username=?",
+                  (role, tools, username))
+    else:
+        c.execute(
+            "INSERT INTO users(username,password,role,approved_tools) VALUES(?,?,?,?)",
+            (username.strip(), _hash(password), role, tools))
+    conn.commit()
+    conn.close()
+
 def render_login_page():
     init_db()
     st.markdown("""
     <div style="max-width:380px;margin:60px auto 0;padding:0 16px;">
       <div style="text-align:center;margin-bottom:32px;">
         <div style="font-size:48px;">⚡</div>
-        <div style="font-size:28px;font-weight:700;color:#d1d4dc;letter-spacing:0.03em;">Option Matrix</div>
-        <div style="font-size:13px;color:#787b86;margin-top:4px;">Professional Options Analytics</div>
+        <div style="font-size:28px;font-weight:700;color:#d1d4dc;
+                    letter-spacing:0.03em;">Option Matrix</div>
+        <div style="font-size:13px;color:#787b86;margin-top:4px;">
+          Professional Options Analytics</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -79,8 +138,10 @@ def render_login_page():
         with tab_login:
             st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
             username = st.text_input("Username", placeholder="username", key="li_user")
-            password = st.text_input("Password", type="password", placeholder="••••••••", key="li_pw")
-            if st.button("Sign In →", use_container_width=True, type="primary", key="btn_login"):
+            password = st.text_input("Password", type="password",
+                                     placeholder="••••••••", key="li_pw")
+            if st.button("Sign In →", use_container_width=True,
+                         type="primary", key="btn_login"):
                 if not username or not password:
                     st.error("Please fill in all fields.")
                 else:
@@ -99,10 +160,14 @@ def render_login_page():
 
         with tab_reg:
             st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-            r_user = st.text_input("Username", placeholder="choose username", key="reg_user")
-            r_pw   = st.text_input("Password", type="password", placeholder="min 6 chars", key="reg_pw")
-            r_pw2  = st.text_input("Confirm Password", type="password", placeholder="repeat", key="reg_pw2")
-            if st.button("Create Account →", use_container_width=True, type="primary", key="btn_reg"):
+            r_user = st.text_input("Username", placeholder="choose username",
+                                   key="reg_user")
+            r_pw   = st.text_input("Password", type="password",
+                                   placeholder="min 6 chars", key="reg_pw")
+            r_pw2  = st.text_input("Confirm Password", type="password",
+                                   placeholder="repeat", key="reg_pw2")
+            if st.button("Create Account →", use_container_width=True,
+                         type="primary", key="btn_reg"):
                 if not all([r_user, r_pw, r_pw2]):
                     st.error("Please fill in all fields.")
                 elif len(r_pw) < 6:
