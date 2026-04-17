@@ -228,11 +228,11 @@ def get_token() -> str:
     Reads st.secrets in normal Streamlit context, then delegates to cached fn.
     Raises RuntimeError with a clear message on failure.
     """
-    cid  = _s("FYERS_CLIENT_ID")
-    sec  = _s("FYERS_SECRET_KEY")
-    user = _s("FYERS_USERNAME")
-    pin  = _s("FYERS_PIN")
-    totp = _s("FYERS_TOTP_KEY")
+    cid  = _s("0Z0FI0BJS0-100")
+    sec  = _s("MZS89VWU3I")
+    user = _s("XA03074")
+    pin  = _s("9518")
+    totp = _s("MM3N4EAJDKRHPNEPFQXJ74LBHYLR74NK")
 
     missing = [k for k, v in {
         "FYERS_CLIENT_ID": cid, "FYERS_SECRET_KEY": sec,
