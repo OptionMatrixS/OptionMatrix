@@ -1,35 +1,38 @@
 """
-fyers_client.py  —  Option Matrix  (Fyers API v3)
-=================================================
-Streamlit secrets required:
-  FYERS_CLIENT_ID  = "ABCD1234-100"
-  FYERS_SECRET_KEY = "xxxxxxxxxxxxxxxx"
-  FYERS_USERNAME   = "XY12345"           # your Fyers client / FY ID
+fyers_client.py  —  Option Matrix
+===================================
+Fyers API v3 — TOTP auto-login, identical to the working dashboard.py
+your friend shared.
+
+Streamlit secrets (Settings → Secrets in Streamlit Cloud):
+  FYERS_CLIENT_ID  = "XXXX-100"
+  FYERS_SECRET_KEY = "your_secret_key"
+  FYERS_USERNAME   = "XY12345"
   FYERS_PIN        = "1234"
-  FYERS_TOTP_KEY   = "BASE32TOTPSECRET"  # long key from TOTP setup, NOT 6-digit code
+  FYERS_TOTP_KEY   = "BASE32TOTPSECRET"
 
-Redirect URL in Fyers API dashboard:
-  https://trade.fyers.in/api-login/redirect-uri/index.html
+REDIRECT URI: uses http://127.0.0.1:8080/ — same as your friend's working code.
+Set this EXACT string in: myapi.fyers.in → Apps → your app → Edit → Redirect URL
 
-Why this redirect URI:
-  The TOTP flow does not open a browser, so we use Fyers' own hosted
-  redirect page — the same one used by every publicly available working
-  Fyers TOTP script.  127.0.0.1 requires a local server and will ALWAYS
-  fail on Streamlit Cloud.
+TOTP KEY: The long Base32 string from Fyers TOTP setup (NOT the 6-digit code).
+Example: JBSWY3DPEHPK3PXP
+
+NEVER put secrets in a file on GitHub. ONLY add them in:
+  Streamlit Cloud → your app → ⋮ → Settings → Secrets
 """
 
-import os, base64, hashlib, math, json
+import os, base64, hashlib, math
 import streamlit as st
 import pandas as pd
 import requests as _req
 import pyotp
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from collections import defaultdict
 from urllib.parse import parse_qs, urlparse
 from fyers_apiv3 import fyersModel
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-REDIRECT_URI   = "https://trade.fyers.in/api-login/redirect-uri/index.html"
+REDIRECT_URI   = "http://127.0.0.1:8080/"   # must match Fyers app dashboard exactly
 TOKEN_FILE     = "fyers_token.txt"
 RISK_FREE_RATE = 0.065
 _MONTHS        = ["JAN","FEB","MAR","APR","MAY","JUN",
@@ -46,8 +49,8 @@ _UNDERLYING_SYM = {
 # ─────────────────────────────────────────────────────────────────────────────
 # SECRETS
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _s(key: str) -> str:
+    """Read a secret from Streamlit secrets or env var."""
     try:
         if key in st.secrets:
             return str(st.secrets[key]).strip()
@@ -59,27 +62,28 @@ def _b64(v) -> str:
     return base64.b64encode(str(v).encode()).decode()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOTP LOGIN  —  5-step flow identical to every working Fyers TOTP script
+# TOTP LOGIN  —  exact copy of your friend's working dashboard.py flow
 # ─────────────────────────────────────────────────────────────────────────────
+def generate_token(client_id, secret_key, username, pin, totp_key):
+    """
+    5-step Fyers TOTP login. All credentials passed as args (NOT read from
+    st.secrets here) so this is safe to call from cached context.
+    Returns (access_token, None) on success, (None, error_str) on failure.
 
-def _generate_token(client_id, secret_key, username, pin, totp_key) -> tuple:
+    This is the IDENTICAL flow used in the working friend dashboard.py.
     """
-    All 5 args passed explicitly — never reads st.secrets here
-    so it is safe to call from inside @st.cache_resource.
-    Returns (access_token, None) or (None, error_string).
-    """
-    app_id = client_id.split("-")[0]        # "ABCD1234-100" → "ABCD1234"
+    redirect_uri = REDIRECT_URI
 
     try:
         sess = _req.Session()
 
-        # Step 1 ── send OTP to registered mobile/email
+        # Step 1 — send OTP
         r1 = sess.post(
             "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
             json={"fy_id": _b64(username), "app_id": "2"},
-            timeout=15)
+            timeout=10)
         if r1.status_code == 429:
-            return None, "Fyers rate-limited (HTTP 429). Wait 60 s then Refresh Token."
+            return None, "Rate limited (HTTP 429). Wait 60s then Refresh Token."
         try:
             d1 = r1.json()
         except Exception:
@@ -87,46 +91,44 @@ def _generate_token(client_id, secret_key, username, pin, totp_key) -> tuple:
         if d1.get("s") != "ok":
             return None, f"Step 1 failed: {d1}"
 
-        # Step 2 ── verify TOTP code (generated from base32 key)
+        # Step 2 — verify TOTP
         totp_code = pyotp.TOTP(totp_key).now()
         r2 = sess.post(
             "https://api-t2.fyers.in/vagator/v2/verify_otp",
             json={"request_key": d1["request_key"], "otp": totp_code},
-            timeout=15)
+            timeout=10)
         try:
             d2 = r2.json()
         except Exception:
             return None, f"Step 2 bad response: {r2.text[:200]}"
         if d2.get("s") != "ok":
             return None, (
-                f"Step 2 (TOTP) failed: {d2}\n"
-                "FYERS_TOTP_KEY must be the long Base32 secret (e.g. JBSWY3DPEHPK3PXP) "
-                "shown during TOTP setup — NOT the 6-digit changing code."
+                f"Step 2 (TOTP) failed: {d2}. "
+                "FYERS_TOTP_KEY = long Base32 secret from TOTP setup, NOT the 6-digit code."
             )
 
-        # Step 3 ── verify 4-digit PIN
+        # Step 3 — verify PIN
         r3 = sess.post(
             "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
             json={"request_key": d2["request_key"],
                   "identity_type": "pin",
                   "identifier": _b64(pin)},
-            timeout=15)
+            timeout=10)
         try:
             d3 = r3.json()
         except Exception:
             return None, f"Step 3 bad response: {r3.text[:200]}"
         if d3.get("s") != "ok":
-            return None, f"Step 3 (PIN) failed: {d3} — check FYERS_PIN"
+            return None, f"Step 3 (PIN) failed: {d3}. Check FYERS_PIN."
 
-        # Step 4 ── get auth-code
-        # appType MUST match what is set in myapi.fyers.in for your app.
-        # For personal apps created on the dashboard it is always "100".
+        # Step 4 — get auth code
+        app_id = client_id.split("-")[0]   # "ABCD1234-100" → "ABCD1234"
         r4 = sess.post(
             "https://api-t1.fyers.in/api/v3/token",
             json={
                 "fyers_id":       username,
                 "app_id":         app_id,
-                "redirect_uri":   REDIRECT_URI,
+                "redirect_uri":   redirect_uri,
                 "appType":        "100",
                 "code_challenge": "",
                 "state":          "sample",
@@ -136,20 +138,19 @@ def _generate_token(client_id, secret_key, username, pin, totp_key) -> tuple:
                 "create_cookie":  True,
             },
             headers={"Authorization": f"Bearer {d3['data']['access_token']}"},
-            timeout=15)
+            timeout=10)
         try:
             d4 = r4.json()
         except Exception:
             return None, f"Step 4 bad response: {r4.text[:200]}"
         if d4.get("s") != "ok":
             return None, (
-                f"Step 4 (auth-code) failed: {d4}\n"
-                f"Redirect URL in Fyers API dashboard MUST be exactly:\n"
-                f"  {REDIRECT_URI}\n"
-                f"Go to myapi.fyers.in → Apps → your app → Edit → Redirect URL"
+                f"Step 4 failed: {d4}\n"
+                f"→ 'redirectUrl mismatch': set Redirect URL in Fyers app to exactly: {REDIRECT_URI}\n"
+                f"→ 'apptype mismatch': FYERS_CLIENT_ID must end in -100, e.g. ABCD1234-100"
             )
 
-        # Extract auth_code from wherever Fyers puts it
+        # Extract auth_code from URL
         data = d4.get("data", {})
         url  = d4.get("Url", "") or data.get("url", "")
         auth_code = (
@@ -158,16 +159,19 @@ def _generate_token(client_id, secret_key, username, pin, totp_key) -> tuple:
             or parse_qs(urlparse(url).query).get("auth_code", [None])[0]
         )
         if not auth_code:
-            return None, f"Step 4: no auth_code found in {d4}"
+            return None, f"Step 4: no auth_code in response: {d4}"
 
-        # Step 5 ── exchange auth_code for access_token (new v3 method: SHA-256 hash)
+        # Step 5 — exchange auth_code for access_token via SHA-256 hash
+        # (new Fyers API v3 method — used by your friend's working code)
         app_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
         r5 = sess.post(
             "https://api-t1.fyers.in/api/v3/validate-authcode",
-            json={"grant_type": "authorization_code",
-                  "appIdHash":  app_hash,
-                  "code":       auth_code},
-            timeout=15)
+            json={
+                "grant_type": "authorization_code",
+                "appIdHash":  app_hash,
+                "code":       auth_code,
+            },
+            timeout=10)
         try:
             d5 = r5.json()
         except Exception:
@@ -175,19 +179,19 @@ def _generate_token(client_id, secret_key, username, pin, totp_key) -> tuple:
         token = d5.get("access_token")
 
         if not token:
-            # Fallback: legacy SessionModel (some older app versions)
+            # Fallback: legacy SessionModel (older Fyers SDK versions)
             try:
-                sess_model = fyersModel.SessionModel(
+                s_model = fyersModel.SessionModel(
                     client_id=client_id, secret_key=secret_key,
-                    redirect_uri=REDIRECT_URI,
+                    redirect_uri=redirect_uri,
                     response_type="code", grant_type="authorization_code")
-                sess_model.set_token(auth_code)
-                d5b   = sess_model.generate_token()
+                s_model.set_token(auth_code)
+                d5b   = s_model.generate_token()
                 token = d5b.get("access_token")
                 if not token:
                     return None, f"Step 5 both methods failed: {d5} / {d5b}"
-            except Exception as e:
-                return None, f"Step 5 failed: {d5} / SDK error: {e}"
+            except Exception as ex:
+                return None, f"Step 5 failed: {d5} / SDK: {ex}"
 
         return token, None
 
@@ -196,13 +200,20 @@ def _generate_token(client_id, secret_key, username, pin, totp_key) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CACHED TOKEN  (credentials as args → safe inside @st.cache_resource)
+# TOKEN MANAGEMENT
+# Key insight: @st.cache_resource caches BOTH success AND failure.
+# So if login fails once, it gets stuck returning None forever until reboot.
+# Fix: cache only successful tokens; on failure, allow retry.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def _cached_token(client_id, secret_key, username, pin, totp_key) -> tuple:
-    """Runs _generate_token once per Streamlit server restart. Caches result."""
-    # Try persisted file first (survives hot-reloads)
+def _cached_token(client_id, secret_key, username, pin, totp_key):
+    """
+    Cached version — only called after validation passes.
+    Tries token file first, then TOTP login.
+    Returns (token, None) — ONLY caches successes.
+    """
+    # Try saved token file first (survives hot-reloads within same day)
     try:
         with open(TOKEN_FILE) as f:
             tok = f.read().strip()
@@ -211,7 +222,8 @@ def _cached_token(client_id, secret_key, username, pin, totp_key) -> tuple:
     except FileNotFoundError:
         pass
 
-    token, err = _generate_token(client_id, secret_key, username, pin, totp_key)
+    # Generate fresh token
+    token, err = generate_token(client_id, secret_key, username, pin, totp_key)
     if token:
         try:
             with open(TOKEN_FILE, "w") as f:
@@ -219,14 +231,15 @@ def _cached_token(client_id, secret_key, username, pin, totp_key) -> tuple:
         except Exception:
             pass
         return token, None
-    return None, err
+
+    # Return error WITHOUT caching — raise so @st.cache_resource doesn't store it
+    raise RuntimeError(err)
 
 
 def get_token() -> str:
     """
-    Public entry-point for all modules.
-    Reads st.secrets in normal Streamlit context, then delegates to cached fn.
-    Raises RuntimeError with a clear message on failure.
+    Public entry-point. Reads secrets in normal Streamlit context,
+    then calls cached generator. Raises on failure with clear message.
     """
     cid  = _s("FYERS_CLIENT_ID")
     sec  = _s("FYERS_SECRET_KEY")
@@ -236,41 +249,37 @@ def get_token() -> str:
 
     missing = [k for k, v in {
         "FYERS_CLIENT_ID": cid, "FYERS_SECRET_KEY": sec,
-        "FYERS_USERNAME": user, "FYERS_PIN": pin, "FYERS_TOTP_KEY": totp,
+        "FYERS_USERNAME":  user, "FYERS_PIN": pin, "FYERS_TOTP_KEY": totp,
     }.items() if not v]
     if missing:
         raise RuntimeError(
-            f"Missing Fyers secrets: {', '.join(missing)}\n"
-            f"Add them in Streamlit Cloud → Settings → Secrets:\n"
-            f'  FYERS_CLIENT_ID  = "XXXX-100"\n'
-            f'  FYERS_SECRET_KEY = "..."\n'
-            f'  FYERS_USERNAME   = "XY12345"\n'
-            f'  FYERS_PIN        = "1234"\n'
-            f'  FYERS_TOTP_KEY   = "BASE32SECRET"'
+            f"Missing secrets: {', '.join(missing)}\n"
+            f"Add them in Streamlit Cloud → your app → ⋮ → Settings → Secrets.\n"
+            f"Do NOT put secrets in any file on GitHub."
         )
 
-    token, err = _cached_token(cid, sec, user, pin, totp)
-    if token:
+    try:
+        token, _ = _cached_token(cid, sec, user, pin, totp)
         return token
-    raise RuntimeError(
-        f"Fyers login failed:\n{err}\n\n"
-        f"Redirect URL in Fyers API dashboard must be:\n  {REDIRECT_URI}"
-    )
+    except RuntimeError as e:
+        raise RuntimeError(str(e))
+    except Exception as e:
+        raise RuntimeError(f"Login failed: {e}")
 
 
 def get_fyers_client():
-    """Returns authenticated FyersModel, cached in session state."""
+    """Authenticated FyersModel, cached in session state."""
     if st.session_state.get("_fc"):
         return st.session_state._fc
-    tok    = get_token()
-    cid    = _s("FYERS_CLIENT_ID")
-    client = fyersModel.FyersModel(client_id=cid, token=tok, log_path="")
-    st.session_state._fc = client
-    return client
+    tok = get_token()
+    cid = _s("FYERS_CLIENT_ID")
+    fc  = fyersModel.FyersModel(client_id=cid, token=tok, log_path="")
+    st.session_state._fc = fc
+    return fc
 
 
 def refresh_token():
-    """Clear everything so next call generates a fresh token."""
+    """Force fresh login on next call."""
     _cached_token.clear()
     st.session_state.pop("_fc", None)
     try:
@@ -287,7 +296,7 @@ def refresh_token():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def _fetch_expiry_map(token: str, cid: str, sym: str) -> dict:
+def _fetch_expiry_map(token, cid, sym):
     """{label: code} for all future expiries. Cached per (token, sym)."""
     try:
         fyers = fyersModel.FyersModel(client_id=cid, token=token, log_path="")
@@ -314,13 +323,9 @@ def _fetch_expiry_map(token: str, cid: str, sym: str) -> dict:
 
         result = {}
         for yy, mm, dd, mon in parsed:
-            is_m = (dd == last_day[(yy, mm)])
-            if is_m:
-                code  = f"{yy:02d}{mon}"           # 26MAY
-                label = f"{dd:02d} {mon} {yy:02d} (M)"
-            else:
-                code  = f"{yy:02d}{mm:02d}{dd:02d}" # 260516
-                label = f"{dd:02d} {mon} {yy:02d} (W)"
+            is_m  = (dd == last_day[(yy, mm)])
+            code  = f"{yy:02d}{mon}" if is_m else f"{yy:02d}{mm:02d}{dd:02d}"
+            label = f"{dd:02d} {mon} {yy:02d} ({'M' if is_m else 'W'})"
             result[label] = code
         return result
     except Exception:
@@ -328,24 +333,23 @@ def _fetch_expiry_map(token: str, cid: str, sym: str) -> dict:
 
 
 def get_expiries(index: str) -> list:
-    cache = f"expiries_{index}"
-    if st.session_state.get(cache):
-        return list(st.session_state[cache].keys())
+    ck = f"expiries_{index}"
+    if st.session_state.get(ck):
+        return list(st.session_state[ck].keys())
     tok  = get_token()
     cid  = _s("FYERS_CLIENT_ID")
     sym  = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
     data = _fetch_expiry_map(tok, cid, sym)
     if not data:
         raise ValueError(
-            f"No expiries returned from Fyers for {index}.\n"
-            f"Token may be expired — click Refresh Token in the sidebar.")
-    st.session_state[cache] = data
+            f"No expiries from Fyers for {index}. "
+            "Token may be expired — click Refresh Token in sidebar.")
+    st.session_state[ck] = data
     return list(data.keys())
 
 
 def _label_to_code(index: str, label: str) -> str:
-    data = st.session_state.get(f"expiries_{index}", {})
-    return data.get(label, label)
+    return st.session_state.get(f"expiries_{index}", {}).get(label, label)
 
 
 def _code_to_date(code: str) -> date:
@@ -367,16 +371,19 @@ def _dte(label: str, index: str = "") -> float:
     except Exception:
         return 30 / 365.0
 
+# alias for data_helpers
+_days_to_expiry = _dte
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STRIKES
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_strikes(index: str, expiry_label: str) -> list:
-    code  = _label_to_code(index, expiry_label)
-    cache = f"strikes_{index}_{code}"
-    if st.session_state.get(cache):
-        return st.session_state[cache]
+    code = _label_to_code(index, expiry_label)
+    ck   = f"strikes_{index}_{code}"
+    if st.session_state.get(ck):
+        return st.session_state[ck]
     try:
         fyers = get_fyers_client()
         sym   = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
@@ -391,11 +398,10 @@ def get_strikes(index: str, expiry_label: str) -> list:
                     pass
             if strikes:
                 result = sorted(strikes)
-                st.session_state[cache] = result
+                st.session_state[ck] = result
                 return result
     except Exception:
         pass
-    # ATM fallback
     atm  = {"NIFTY": 22800, "SENSEX": 82500, "BANKNIFTY": 48000}.get(index, 22800)
     step = 50 if index == "NIFTY" else (100 if index == "BANKNIFTY" else 500)
     return list(range(atm - 20*step, atm + 21*step, step))
@@ -408,11 +414,11 @@ def get_strikes(index: str, expiry_label: str) -> list:
 def build_symbol(index: str, expiry_label: str, cp: str, strike: int) -> str:
     exch = "BSE" if index in ("SENSEX", "BANKEX") else "NSE"
     code = _label_to_code(index, expiry_label).strip().upper()
-    ot   = "CE" if cp.upper() in ("CE","C") else "PE"
+    ot   = "CE" if cp.upper() in ("CE", "C") else "PE"
     if any(c.isalpha() for c in code):
-        return f"{exch}:{index}{code}{ot}{strike}"       # monthly
+        return f"{exch}:{index}{code}{ot}{strike}"
     yy, mm, dd = code[:2], str(int(code[2:4])), code[4:6]
-    return f"{exch}:{index}{yy}{mm}{dd}{ot}{strike}"     # weekly
+    return f"{exch}:{index}{yy}{mm}{dd}{ot}{strike}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -443,8 +449,7 @@ def _get_candles(index, strike, expiry_label, cp, interval=1, date_str=None):
     sym = build_symbol(index, expiry_label, cp, strike)
     df  = _fetch_candles(sym, interval, date_str)
     if df.empty:
-        raise ValueError(f"No candle data for {sym}. "
-                         "Check date is a trading day and contract was active.")
+        raise ValueError(f"No data for {sym}. Check date is a trading day.")
     return df
 
 
@@ -460,11 +465,11 @@ def _quote(symbol: str) -> dict:
     v   = resp["d"][0]["v"]
     ltp = float(v.get("lp", 0))
     return {"ltp": ltp,
-            "bid": float(v.get("bid", ltp*.998)),
-            "ask": float(v.get("ask", ltp*1.002)),
+            "bid": float(v.get("bid",             ltp * 0.998)),
+            "ask": float(v.get("ask",             ltp * 1.002)),
             "prev_close": float(v.get("prev_close_price", 0)),
-            "high": float(v.get("high_price", ltp)),
-            "low":  float(v.get("low_price",  ltp))}
+            "high": float(v.get("high_price",     ltp)),
+            "low":  float(v.get("low_price",      ltp))}
 
 def get_live_quote(index, strike, expiry_label, cp) -> dict:
     _validate_leg(index, strike, expiry_label, cp)
@@ -489,8 +494,8 @@ def get_spot_price(index: str) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _validate_leg(index, strike, expiry, cp):
-    if not index:           raise ValueError("Index not selected.")
-    if not expiry:          raise ValueError(f"Expiry not selected for {index}.")
+    if not index:             raise ValueError("Index not selected.")
+    if not expiry:            raise ValueError(f"Expiry not selected for {index}.")
     if not strike or strike <= 0: raise ValueError(f"Invalid strike {strike}.")
     if cp not in ("CE","PE"): raise ValueError(f"cp must be CE or PE, got {cp}.")
 
@@ -535,47 +540,53 @@ def get_live_spread_ohlcv(legs, interval=1, date_str=None) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ncdf(x):
-    return (1 + math.erf(x/math.sqrt(2)))/2
+    return (1 + math.erf(x / math.sqrt(2))) / 2
 
 def _npdf(x):
-    return math.exp(-.5*x*x)/math.sqrt(2*math.pi)
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 
-def bs_price(S,K,T,r,sig,cp):
-    if T<=0 or sig<=0: return max(0.,(S-K) if cp=="CE" else (K-S))
-    d1=(math.log(S/K)+(r+.5*sig**2)*T)/(sig*math.sqrt(T)); d2=d1-sig*math.sqrt(T)
-    return S*_ncdf(d1)-K*math.exp(-r*T)*_ncdf(d2) if cp=="CE" else K*math.exp(-r*T)*_ncdf(-d2)-S*_ncdf(-d1)
+def bs_price(S, K, T, r, sig, cp):
+    if T <= 0 or sig <= 0:
+        return max(0., (S-K) if cp == "CE" else (K-S))
+    d1 = (math.log(S/K) + (r + 0.5*sig**2)*T) / (sig*math.sqrt(T))
+    d2 = d1 - sig*math.sqrt(T)
+    return (S*_ncdf(d1) - K*math.exp(-r*T)*_ncdf(d2) if cp == "CE"
+            else K*math.exp(-r*T)*_ncdf(-d2) - S*_ncdf(-d1))
 
-def implied_volatility(mp,S,K,T,r,cp):
-    if mp<=0 or S<=0 or K<=0 or T<=0: return 0.
-    lo,hi=.001,5.
+def implied_volatility(mp, S, K, T, r, cp):
+    if mp <= 0 or S <= 0 or K <= 0 or T <= 0: return 0.
+    lo, hi = 0.001, 5.
     for _ in range(200):
-        mid=( lo+hi)/2; p=bs_price(S,K,T,r,mid,cp)
-        if abs(p-mp)<1e-5: return mid
-        lo,hi=(mid,hi) if p<mp else (lo,mid)
+        mid = (lo + hi) / 2; p = bs_price(S, K, T, r, mid, cp)
+        if abs(p - mp) < 1e-5: return mid
+        lo, hi = (mid, hi) if p < mp else (lo, mid)
     return mid
 
-def bs_greeks(S,K,T,r,sig,cp):
-    if T<=0 or sig<=0: return {"delta":0,"gamma":0,"vega":0,"theta":0,"iv":sig*100}
-    d1=(math.log(S/K)+(r+.5*sig**2)*T)/(sig*math.sqrt(T)); d2=d1-sig*math.sqrt(T)
-    pdf=_npdf(d1); g=pdf/(S*sig*math.sqrt(T)); v=S*pdf*math.sqrt(T)/100
-    d=_ncdf(d1) if cp=="CE" else _ncdf(d1)-1
-    t=(-(S*pdf*sig)/(2*math.sqrt(T)) + (-r*K*math.exp(-r*T)*_ncdf(d2) if cp=="CE"
-       else r*K*math.exp(-r*T)*_ncdf(-d2)))/365
+def bs_greeks(S, K, T, r, sig, cp):
+    if T <= 0 or sig <= 0:
+        return {"delta":0,"gamma":0,"vega":0,"theta":0,"iv":sig*100}
+    d1  = (math.log(S/K)+(r+0.5*sig**2)*T)/(sig*math.sqrt(T))
+    d2  = d1 - sig*math.sqrt(T)
+    pdf = _npdf(d1); g = pdf/(S*sig*math.sqrt(T)); v = S*pdf*math.sqrt(T)/100
+    d   = _ncdf(d1) if cp == "CE" else _ncdf(d1) - 1
+    t   = (-(S*pdf*sig)/(2*math.sqrt(T)) +
+           (-r*K*math.exp(-r*T)*_ncdf(d2) if cp == "CE"
+            else r*K*math.exp(-r*T)*_ncdf(-d2))) / 365
     return {"delta":round(d,4),"gamma":round(g,6),
             "vega":round(v,4),"theta":round(t,4),"iv":round(sig*100,2)}
 
-def get_spread_greeks(legs,spots):
+def get_spread_greeks(legs, spots):
     validate_legs(legs)
-    net={"delta":0.,"gamma":0.,"vega":0.,"theta":0.,"ivs":[]}
+    net = {"delta":0.,"gamma":0.,"vega":0.,"theta":0.,"ivs":[]}
     for leg in legs:
         try:
-            S=float(spots.get(leg["index"],22800)); K=float(leg["strike"])
-            T=_dte(leg["expiry"],leg["index"])
-            ltp=get_live_ltp(leg["index"],leg["strike"],leg["expiry"],leg["cp"])
-            sig=implied_volatility(ltp,S,K,T,RISK_FREE_RATE,leg["cp"])
-            g=bs_greeks(S,K,T,RISK_FREE_RATE,sig,leg["cp"])
-            sign=1 if leg["bs"]=="Buy" else -1; ratio=leg["ratio"]
-            for k in ("delta","gamma","vega","theta"): net[k]+=sign*ratio*g[k]
+            S   = float(spots.get(leg["index"], 22800)); K = float(leg["strike"])
+            T   = _dte(leg["expiry"], leg["index"])
+            ltp = get_live_ltp(leg["index"], leg["strike"], leg["expiry"], leg["cp"])
+            sig = implied_volatility(ltp, S, K, T, RISK_FREE_RATE, leg["cp"])
+            g   = bs_greeks(S, K, T, RISK_FREE_RATE, sig, leg["cp"])
+            sgn = 1 if leg["bs"] == "Buy" else -1; r = leg["ratio"]
+            for k in ("delta","gamma","vega","theta"): net[k] += sgn*r*g[k]
             net["ivs"].append(g["iv"])
         except Exception: pass
     return {"delta":round(net["delta"],4),"gamma":round(net["gamma"],6),
@@ -587,26 +598,29 @@ def get_spread_greeks(legs,spots):
 # IV SERIES  /  MULTIPLIER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_iv_series_live(index,strike,expiry_label,cp,tf_minutes=5,date_str=None):
-    _validate_leg(index,strike,expiry_label,cp)
-    df=_get_candles(index,strike,expiry_label,cp,tf_minutes,date_str)
-    spot=get_spot_price(index); T=_dte(expiry_label,index); rows=[]
-    for ts,row in df.iterrows():
-        try: iv=implied_volatility(row["close"],spot,strike,T,RISK_FREE_RATE,cp); rows.append({"time":ts,"iv_pct":round(iv*100,2)})
-        except Exception: rows.append({"time":ts,"iv_pct":0.})
+def get_iv_series_live(index, strike, expiry_label, cp, tf_minutes=5, date_str=None):
+    _validate_leg(index, strike, expiry_label, cp)
+    df   = _get_candles(index, strike, expiry_label, cp, tf_minutes, date_str)
+    spot = get_spot_price(index); T = _dte(expiry_label, index); rows = []
+    for ts, row in df.iterrows():
+        try: iv = implied_volatility(row["close"], spot, strike, T, RISK_FREE_RATE, cp)
+        except Exception: iv = 0.
+        rows.append({"time": ts, "iv_pct": round(iv*100, 2)})
     return pd.DataFrame(rows)
 
-def get_multiplier_series_live(sx_strike,sx_expiry,n_strike,n_expiry,interval=1,date_str=None):
-    for i,s,e,c in [("SENSEX",sx_strike,sx_expiry,"CE"),("SENSEX",sx_strike,sx_expiry,"PE"),
-                    ("NIFTY",n_strike,n_expiry,"CE"),("NIFTY",n_strike,n_expiry,"PE")]:
-        _validate_leg(i,s,e,c)
-    sx_ce=_get_candles("SENSEX",sx_strike,sx_expiry,"CE",interval,date_str)["close"]
-    sx_pe=_get_candles("SENSEX",sx_strike,sx_expiry,"PE",interval,date_str)["close"]
-    n_ce =_get_candles("NIFTY", n_strike, n_expiry, "CE",interval,date_str)["close"]
-    n_pe =_get_candles("NIFTY", n_strike, n_expiry, "PE",interval,date_str)["close"]
-    sx_s=sx_strike+sx_ce-sx_pe; n_s=n_strike+n_ce-n_pe; mult=(sx_s/n_s).round(4)
-    return pd.DataFrame({"time":sx_s.index,"multiplier":mult.values,
-                         "sx_synth":sx_s.values.round(2),"n_synth":n_s.values.round(2)}).reset_index(drop=True)
-
-# Re-export for data_helpers
-_days_to_expiry = _dte
+def get_multiplier_series_live(sx_strike, sx_expiry, n_strike, n_expiry,
+                                interval=1, date_str=None):
+    for i, s, e, c in [("SENSEX",sx_strike,sx_expiry,"CE"),
+                        ("SENSEX",sx_strike,sx_expiry,"PE"),
+                        ("NIFTY", n_strike, n_expiry, "CE"),
+                        ("NIFTY", n_strike, n_expiry, "PE")]:
+        _validate_leg(i, s, e, c)
+    sx_ce = _get_candles("SENSEX",sx_strike,sx_expiry,"CE",interval,date_str)["close"]
+    sx_pe = _get_candles("SENSEX",sx_strike,sx_expiry,"PE",interval,date_str)["close"]
+    n_ce  = _get_candles("NIFTY", n_strike, n_expiry, "CE",interval,date_str)["close"]
+    n_pe  = _get_candles("NIFTY", n_strike, n_expiry, "PE",interval,date_str)["close"]
+    sx_s  = sx_strike + sx_ce - sx_pe; n_s = n_strike + n_ce - n_pe
+    mult  = (sx_s / n_s).round(4)
+    return pd.DataFrame({"time": sx_s.index, "multiplier": mult.values,
+                         "sx_synth": sx_s.values.round(2),
+                         "n_synth": n_s.values.round(2)}).reset_index(drop=True)
