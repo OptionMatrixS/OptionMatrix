@@ -3,36 +3,35 @@ fyers_client.py  —  Option Matrix
 ===================================
 Fyers API v3 TOTP auto-login.
 
-Based on the exact working code from Fyers community (verified working 2024-2025):
-https://fyers.in/community/questions-5gz5j8db/post/auto-login-using-totp-key-NFNtEq11kswFUL1
+This uses the EXACT same login flow as the working dashboard.py 
+shared by your friend (document index 4 in this conversation).
 
-Critical differences from broken versions:
-- Step 4 (token) checks for status 308, not 200
-- PIN sent as PLAIN STRING, NOT base64 encoded
-- Step 5 uses SessionModel.generate_token(), NOT validate-authcode
-- send_login_otp_v2 for step 1
-- verify_pin_v2 for step 3
+Critical details that must match:
+  - send_login_otp_v2  +  fy_id BASE64 encoded
+  - verify_otp
+  - verify_pin_v2      +  identifier BASE64 encoded
+  - /api/v3/token      (check status 308, extract auth_code from Url)
+  - SessionModel.generate_token()  (NOT validate-authcode)
 
-Streamlit secrets (Settings → Secrets in Streamlit Cloud):
-  FYERS_CLIENT_ID  = "XXXX-100"          e.g. "ABCD1234-100"
-  FYERS_SECRET_KEY = "your_secret"
-  FYERS_USERNAME   = "XY12345"           your Fyers client/FY ID
-  FYERS_PIN        = "1234"              4-digit PIN as string
-  FYERS_TOTP_KEY   = "BASE32SECRET"      long key from TOTP setup, NOT 6-digit code
+Streamlit secrets required (Settings → Secrets in Streamlit Cloud):
+  FYERS_CLIENT_ID  = "XXXX-100"
+  FYERS_SECRET_KEY = "your_secret_key"
+  FYERS_USERNAME   = "XY12345"
+  FYERS_PIN        = "1234"
+  FYERS_TOTP_KEY   = "BASE32TOTPSECRET"
 
-Redirect URL in Fyers app dashboard (myapi.fyers.in):
-  Must EXACTLY match REDIRECT_URI below.
-  Do NOT put secrets in GitHub — only in Streamlit Cloud secrets.
+Redirect URL must EXACTLY match what is in myapi.fyers.in → Apps → your app:
+  REDIRECT_URI = "http://127.0.0.1:8080/"
 """
 
-import os, base64, math, json
+import os, base64, math
 import streamlit as st
 import pandas as pd
 import requests as _req
 import pyotp
 from datetime import datetime, date
 from collections import defaultdict
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, parse_qs
 from fyers_apiv3 import fyersModel
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -51,9 +50,11 @@ _UNDERLYING_SYM = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECRETS
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
 def _s(key: str) -> str:
+    """Read secret from Streamlit Cloud secrets or env var."""
     try:
         if key in st.secrets:
             return str(st.secrets[key]).strip()
@@ -61,140 +62,135 @@ def _s(key: str) -> str:
         pass
     return os.environ.get(key, "").strip()
 
-def _b64(v) -> str:
-    return base64.b64encode(str(v).encode()).decode()
+def _b64(value) -> str:
+    """Base64 encode a value — used for fy_id and pin."""
+    return base64.b64encode(str(value).encode()).decode()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOTP LOGIN  —  exact pattern from verified working Fyers community code
+# TOKEN GENERATION — exact copy of friend's working dashboard.py flow
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_token(client_id, secret_key, username, pin, totp_key):
     """
-    6-step Fyers TOTP login.
-    Returns (access_token, None) on success, (None, error_str) on failure.
-
-    Verified working pattern — all args passed explicitly so this is safe
-    to call from @st.cache_resource context.
+    Generates Fyers access token via TOTP.
+    This is the EXACT same flow as the working friend dashboard.py.
+    All args passed explicitly — safe to call from @st.cache_resource.
+    Returns (access_token, None) or (None, error_string).
     """
-    app_id   = client_id.split("-")[0]   # "ABCD1234-100" → "ABCD1234"
-    app_type = "100"
-
-    BASE_URL   = "https://api-t2.fyers.in/vagator/v2"
-    BASE_URL_2 = "https://api-t1.fyers.in/api/v3"
-
-    URL_SEND_OTP   = BASE_URL   + "/send_login_otp_v2"
-    URL_VERIFY_OTP = BASE_URL   + "/verify_otp"
-    URL_VERIFY_PIN = BASE_URL   + "/verify_pin_v2"
-    URL_TOKEN      = BASE_URL_2 + "/token"
+    redirect_uri = REDIRECT_URI
 
     try:
-        # ── Step 1: send login OTP ────────────────────────────────────────────
-        r1 = _req.post(
-            URL_SEND_OTP,
+        s = _req.Session()
+
+        # ── Step 1: Send login OTP ────────────────────────────────────────────
+        # Uses v2 endpoint + fy_id BASE64 encoded (same as friend's code)
+        r1 = s.post(
+            "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
             json={"fy_id": _b64(username), "app_id": "2"},
             timeout=15)
+
         if r1.status_code == 429:
-            return None, "Rate limited (HTTP 429). Wait 60 s then click Refresh Token."
+            return None, "Rate limited (HTTP 429). Wait 60 seconds then click Refresh Token."
         try:
             d1 = r1.json()
         except Exception:
-            return None, f"Step 1 bad response ({r1.status_code}): {r1.text[:200]}"
+            return None, f"Step 1 bad response (HTTP {r1.status_code}): {r1.text[:200]}"
         if d1.get("s") != "ok":
             return None, f"Step 1 (send OTP) failed: {d1}"
 
-        # ── Step 2: generate TOTP ─────────────────────────────────────────────
+        # ── Step 2: Verify TOTP ───────────────────────────────────────────────
         totp_code = pyotp.TOTP(totp_key).now()
-
-        # ── Step 3: verify TOTP ───────────────────────────────────────────────
-        r2 = _req.post(
-            URL_VERIFY_OTP,
+        r2 = s.post(
+            "https://api-t2.fyers.in/vagator/v2/verify_otp",
             json={"request_key": d1["request_key"], "otp": totp_code},
             timeout=15)
         try:
             d2 = r2.json()
         except Exception:
-            return None, f"Step 3 bad response: {r2.text[:200]}"
+            return None, f"Step 2 bad response: {r2.text[:200]}"
         if d2.get("s") != "ok":
             return None, (
-                f"Step 3 (verify TOTP) failed: {d2}\n"
-                "FYERS_TOTP_KEY must be the long Base32 secret from TOTP setup "
-                "(e.g. JBSWY3DPEHPK3PXP), NOT the 6-digit changing code."
+                f"Step 2 (verify TOTP) failed: {d2}\n"
+                "FYERS_TOTP_KEY must be the long Base32 secret shown during TOTP setup, "
+                "NOT the 6-digit code that changes every 30 seconds."
             )
 
-        # ── Step 4: verify PIN ────────────────────────────────────────────────
-        # PIN is sent as plain string (NOT base64) — this is what Fyers expects
-        r3 = _req.post(
-            URL_VERIFY_PIN,
+        # ── Step 3: Verify PIN ────────────────────────────────────────────────
+        # Uses verify_pin_v2 + identifier BASE64 encoded (same as friend's code)
+        r3 = s.post(
+            "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
             json={
                 "request_key":   d2["request_key"],
                 "identity_type": "pin",
-                "identifier":    str(pin),     # plain string, NOT base64
+                "identifier":    _b64(pin),   # BASE64 encoded — same as friend
             },
             timeout=15)
         try:
             d3 = r3.json()
         except Exception:
-            return None, f"Step 4 bad response: {r3.text[:200]}"
+            return None, f"Step 3 bad response: {r3.text[:200]}"
         if d3.get("s") != "ok":
-            return None, f"Step 4 (verify PIN) failed: {d3} — check FYERS_PIN"
+            return None, (
+                f"Step 3 (verify PIN) failed: {d3}\n"
+                "Check FYERS_PIN — it must be your 4-digit Fyers login PIN."
+            )
 
-        access_token_step4 = d3["data"]["access_token"]
+        access_token_step3 = d3["data"]["access_token"]
 
-        # ── Step 5: get auth code ─────────────────────────────────────────────
-        # This step returns HTTP 308 (redirect) — check for that, not 200
-        r4 = _req.post(
-            URL_TOKEN,
+        # ── Step 4: Get auth code ─────────────────────────────────────────────
+        # This returns HTTP 308 with auth_code in the redirect Url
+        app_id = client_id.split("-")[0]   # "ABCD1234-100" → "ABCD1234"
+        r4 = s.post(
+            "https://api-t1.fyers.in/api/v3/token",
             json={
                 "fyers_id":       username,
                 "app_id":         app_id,
-                "redirect_uri":   REDIRECT_URI,
-                "appType":        app_type,
+                "redirect_uri":   redirect_uri,
+                "appType":        "100",
                 "code_challenge": "",
-                "state":          "sample_state",
+                "state":          "sample",
                 "scope":          "",
                 "nonce":          "",
                 "response_type":  "code",
                 "create_cookie":  True,
             },
-            headers={"Authorization": f"Bearer {access_token_step4}"},
+            headers={"Authorization": f"Bearer {access_token_step3}"},
             timeout=15,
-            allow_redirects=False)   # don't follow redirect — we need the URL
-
-        # Fyers returns 308 with the auth_code in the redirect URL
-        if r4.status_code not in (200, 308):
-            return None, (
-                f"Step 5 (get auth code) failed — HTTP {r4.status_code}: {r4.text[:300]}\n"
-                f"Redirect URL in Fyers app dashboard must be exactly: {REDIRECT_URI}\n"
-                f"Go to myapi.fyers.in → Apps → your app → Edit → set Redirect URL"
-            )
+            allow_redirects=False)   # must NOT follow redirect
 
         try:
             d4 = r4.json()
         except Exception:
-            return None, f"Step 5 bad response: {r4.text[:200]}"
+            return None, f"Step 4 bad response (HTTP {r4.status_code}): {r4.text[:200]}"
 
-        if d4.get("s") not in ("ok", None) and r4.status_code != 308:
+        # Status 308 = redirect with auth_code
+        if r4.status_code not in (200, 308):
             return None, (
-                f"Step 5 failed: {d4}\n"
-                f"→ 'redirectUrl mismatch': Redirect URL must be: {REDIRECT_URI}\n"
-                f"→ 'apptype mismatch': FYERS_CLIENT_ID must end in -100"
+                f"Step 4 (get auth code) HTTP {r4.status_code}: {d4}\n"
+                f"Redirect URL in Fyers app dashboard must be exactly: {redirect_uri}\n"
+                f"Go to myapi.fyers.in → Apps → your app → Edit → Redirect URL"
             )
 
-        # Extract auth_code from the redirect URL
-        redirect_url = d4.get("Url", "") or d4.get("url", "")
-        if not redirect_url:
-            # Try Location header (for 308)
-            redirect_url = r4.headers.get("Location", "")
+        if d4.get("s") not in ("ok", None):
+            return None, (
+                f"Step 4 failed: {d4}\n"
+                f"'redirectUrl mismatch' → set Redirect URL to: {redirect_uri}\n"
+                f"'apptype mismatch' → FYERS_CLIENT_ID must end in -100"
+            )
+
+        # Extract auth_code from Url field
+        redirect_url = (d4.get("Url") or d4.get("url") or
+                        r4.headers.get("Location", ""))
         auth_code = parse_qs(urlparse(redirect_url).query).get("auth_code", [None])[0]
         if not auth_code:
-            return None, f"Step 5: no auth_code in response: {d4} | location: {redirect_url}"
+            return None, f"Step 4: no auth_code found. Response: {d4}"
 
-        # ── Step 6: exchange auth code → access token via SessionModel ────────
-        # Using fyersModel.SessionModel.generate_token() — the proven working method
+        # ── Step 5: Exchange auth_code for access token ───────────────────────
+        # Using SessionModel.generate_token() — same as friend's working code
         session = fyersModel.SessionModel(
             client_id=client_id,
             secret_key=secret_key,
-            redirect_uri=REDIRECT_URI,
+            redirect_uri=redirect_uri,
             response_type="code",
             grant_type="authorization_code",
         )
@@ -203,7 +199,7 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
 
         token = d5.get("access_token")
         if not token:
-            return None, f"Step 6 (generate token) failed: {d5}"
+            return None, f"Step 5 (generate token) failed: {d5}"
 
         return token, None
 
@@ -213,16 +209,12 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOKEN CACHING
+# Raises RuntimeError on failure so @st.cache_resource does NOT cache the error
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def _cached_token(client_id, secret_key, username, pin, totp_key):
-    """
-    Cached token generator.
-    IMPORTANT: raises RuntimeError on failure so @st.cache_resource does NOT
-    cache the error — next call will retry the login.
-    """
-    # Try saved file first (survives hot-reloads within the same trading day)
+    # Try saved token file first (survives hot-reloads)
     try:
         with open(TOKEN_FILE) as f:
             tok = f.read().strip()
@@ -240,12 +232,11 @@ def _cached_token(client_id, secret_key, username, pin, totp_key):
             pass
         return token
 
-    # Raise so the error is NOT cached — next call retries
-    raise RuntimeError(err or "Unknown login error")
+    raise RuntimeError(err or "Unknown Fyers login error")
 
 
 def get_token() -> str:
-    """Read secrets in Streamlit context, then call cached generator."""
+    """Entry point — reads secrets in Streamlit context, calls cached generator."""
     cid  = _s("FYERS_CLIENT_ID")
     sec  = _s("FYERS_SECRET_KEY")
     user = _s("FYERS_USERNAME")
@@ -254,12 +245,12 @@ def get_token() -> str:
 
     missing = [k for k, v in {
         "FYERS_CLIENT_ID": cid, "FYERS_SECRET_KEY": sec,
-        "FYERS_USERNAME":  user, "FYERS_PIN": pin, "FYERS_TOTP_KEY": totp,
+        "FYERS_USERNAME": user, "FYERS_PIN": pin, "FYERS_TOTP_KEY": totp,
     }.items() if not v]
     if missing:
         raise RuntimeError(
-            f"Missing secrets: {', '.join(missing)}\n"
-            f"Add in Streamlit Cloud → app → ⋮ → Settings → Secrets.\n"
+            f"Missing Fyers secrets: {', '.join(missing)}\n"
+            f"Add them in Streamlit Cloud → your app → ⋮ → Settings → Secrets.\n"
             f"Do NOT put secrets in any file on GitHub."
         )
     return _cached_token(cid, sec, user, pin, totp)
@@ -310,12 +301,10 @@ def _fetch_expiry_map(token, cid, sym):
             except Exception:
                 continue
             parsed.append((yy4 % 100, mm, dd, _MONTHS[mm-1]))
-
         by_month = defaultdict(list)
         for yy, mm, dd, mon in parsed:
             by_month[(yy, mm)].append(dd)
         last_day = {k: max(v) for k, v in by_month.items()}
-
         result = {}
         for yy, mm, dd, mon in parsed:
             is_m  = (dd == last_day[(yy, mm)])
