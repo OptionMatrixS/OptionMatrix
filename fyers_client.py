@@ -1,27 +1,31 @@
 """
 fyers_client.py  —  Option Matrix
 ===================================
-Fyers API v3 — TOTP auto-login, identical to the working dashboard.py
-your friend shared.
+Fyers API v3 TOTP auto-login.
+
+Based on the exact working code from Fyers community (verified working 2024-2025):
+https://fyers.in/community/questions-5gz5j8db/post/auto-login-using-totp-key-NFNtEq11kswFUL1
+
+Critical differences from broken versions:
+- Step 4 (token) checks for status 308, not 200
+- PIN sent as PLAIN STRING, NOT base64 encoded
+- Step 5 uses SessionModel.generate_token(), NOT validate-authcode
+- send_login_otp_v2 for step 1
+- verify_pin_v2 for step 3
 
 Streamlit secrets (Settings → Secrets in Streamlit Cloud):
-  FYERS_CLIENT_ID  = "XXXX-100"
-  FYERS_SECRET_KEY = "your_secret_key"
-  FYERS_USERNAME   = "XY12345"
-  FYERS_PIN        = "1234"
-  FYERS_TOTP_KEY   = "BASE32TOTPSECRET"
+  FYERS_CLIENT_ID  = "XXXX-100"          e.g. "ABCD1234-100"
+  FYERS_SECRET_KEY = "your_secret"
+  FYERS_USERNAME   = "XY12345"           your Fyers client/FY ID
+  FYERS_PIN        = "1234"              4-digit PIN as string
+  FYERS_TOTP_KEY   = "BASE32SECRET"      long key from TOTP setup, NOT 6-digit code
 
-REDIRECT URI: uses http://127.0.0.1:8080/ — same as your friend's working code.
-Set this EXACT string in: myapi.fyers.in → Apps → your app → Edit → Redirect URL
-
-TOTP KEY: The long Base32 string from Fyers TOTP setup (NOT the 6-digit code).
-Example: JBSWY3DPEHPK3PXP
-
-NEVER put secrets in a file on GitHub. ONLY add them in:
-  Streamlit Cloud → your app → ⋮ → Settings → Secrets
+Redirect URL in Fyers app dashboard (myapi.fyers.in):
+  Must EXACTLY match REDIRECT_URI below.
+  Do NOT put secrets in GitHub — only in Streamlit Cloud secrets.
 """
 
-import os, base64, hashlib, math
+import os, base64, math, json
 import streamlit as st
 import pandas as pd
 import requests as _req
@@ -32,7 +36,7 @@ from urllib.parse import parse_qs, urlparse
 from fyers_apiv3 import fyersModel
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-REDIRECT_URI   = "http://127.0.0.1:8080/"   # must match Fyers app dashboard exactly
+REDIRECT_URI   = "http://127.0.0.1:8080/"
 TOKEN_FILE     = "fyers_token.txt"
 RISK_FREE_RATE = 0.065
 _MONTHS        = ["JAN","FEB","MAR","APR","MAY","JUN",
@@ -50,7 +54,6 @@ _UNDERLYING_SYM = {
 # SECRETS
 # ─────────────────────────────────────────────────────────────────────────────
 def _s(key: str) -> str:
-    """Read a secret from Streamlit secrets or env var."""
     try:
         if key in st.secrets:
             return str(st.secrets[key]).strip()
@@ -62,136 +65,145 @@ def _b64(v) -> str:
     return base64.b64encode(str(v).encode()).decode()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOTP LOGIN  —  exact copy of your friend's working dashboard.py flow
+# TOTP LOGIN  —  exact pattern from verified working Fyers community code
 # ─────────────────────────────────────────────────────────────────────────────
+
 def generate_token(client_id, secret_key, username, pin, totp_key):
     """
-    5-step Fyers TOTP login. All credentials passed as args (NOT read from
-    st.secrets here) so this is safe to call from cached context.
+    6-step Fyers TOTP login.
     Returns (access_token, None) on success, (None, error_str) on failure.
 
-    This is the IDENTICAL flow used in the working friend dashboard.py.
+    Verified working pattern — all args passed explicitly so this is safe
+    to call from @st.cache_resource context.
     """
-    redirect_uri = REDIRECT_URI
+    app_id   = client_id.split("-")[0]   # "ABCD1234-100" → "ABCD1234"
+    app_type = "100"
+
+    BASE_URL   = "https://api-t2.fyers.in/vagator/v2"
+    BASE_URL_2 = "https://api-t1.fyers.in/api/v3"
+
+    URL_SEND_OTP   = BASE_URL   + "/send_login_otp_v2"
+    URL_VERIFY_OTP = BASE_URL   + "/verify_otp"
+    URL_VERIFY_PIN = BASE_URL   + "/verify_pin_v2"
+    URL_TOKEN      = BASE_URL_2 + "/token"
 
     try:
-        sess = _req.Session()
-
-        # Step 1 — send OTP
-        r1 = sess.post(
-            "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
+        # ── Step 1: send login OTP ────────────────────────────────────────────
+        r1 = _req.post(
+            URL_SEND_OTP,
             json={"fy_id": _b64(username), "app_id": "2"},
-            timeout=10)
+            timeout=15)
         if r1.status_code == 429:
-            return None, "Rate limited (HTTP 429). Wait 60s then Refresh Token."
+            return None, "Rate limited (HTTP 429). Wait 60 s then click Refresh Token."
         try:
             d1 = r1.json()
         except Exception:
             return None, f"Step 1 bad response ({r1.status_code}): {r1.text[:200]}"
         if d1.get("s") != "ok":
-            return None, f"Step 1 failed: {d1}"
+            return None, f"Step 1 (send OTP) failed: {d1}"
 
-        # Step 2 — verify TOTP
+        # ── Step 2: generate TOTP ─────────────────────────────────────────────
         totp_code = pyotp.TOTP(totp_key).now()
-        r2 = sess.post(
-            "https://api-t2.fyers.in/vagator/v2/verify_otp",
+
+        # ── Step 3: verify TOTP ───────────────────────────────────────────────
+        r2 = _req.post(
+            URL_VERIFY_OTP,
             json={"request_key": d1["request_key"], "otp": totp_code},
-            timeout=10)
+            timeout=15)
         try:
             d2 = r2.json()
         except Exception:
-            return None, f"Step 2 bad response: {r2.text[:200]}"
+            return None, f"Step 3 bad response: {r2.text[:200]}"
         if d2.get("s") != "ok":
             return None, (
-                f"Step 2 (TOTP) failed: {d2}. "
-                "FYERS_TOTP_KEY = long Base32 secret from TOTP setup, NOT the 6-digit code."
+                f"Step 3 (verify TOTP) failed: {d2}\n"
+                "FYERS_TOTP_KEY must be the long Base32 secret from TOTP setup "
+                "(e.g. JBSWY3DPEHPK3PXP), NOT the 6-digit changing code."
             )
 
-        # Step 3 — verify PIN
-        r3 = sess.post(
-            "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
-            json={"request_key": d2["request_key"],
-                  "identity_type": "pin",
-                  "identifier": _b64(pin)},
-            timeout=10)
+        # ── Step 4: verify PIN ────────────────────────────────────────────────
+        # PIN is sent as plain string (NOT base64) — this is what Fyers expects
+        r3 = _req.post(
+            URL_VERIFY_PIN,
+            json={
+                "request_key":   d2["request_key"],
+                "identity_type": "pin",
+                "identifier":    str(pin),     # plain string, NOT base64
+            },
+            timeout=15)
         try:
             d3 = r3.json()
         except Exception:
-            return None, f"Step 3 bad response: {r3.text[:200]}"
+            return None, f"Step 4 bad response: {r3.text[:200]}"
         if d3.get("s") != "ok":
-            return None, f"Step 3 (PIN) failed: {d3}. Check FYERS_PIN."
+            return None, f"Step 4 (verify PIN) failed: {d3} — check FYERS_PIN"
 
-        # Step 4 — get auth code
-        app_id = client_id.split("-")[0]   # "ABCD1234-100" → "ABCD1234"
-        r4 = sess.post(
-            "https://api-t1.fyers.in/api/v3/token",
+        access_token_step4 = d3["data"]["access_token"]
+
+        # ── Step 5: get auth code ─────────────────────────────────────────────
+        # This step returns HTTP 308 (redirect) — check for that, not 200
+        r4 = _req.post(
+            URL_TOKEN,
             json={
                 "fyers_id":       username,
                 "app_id":         app_id,
-                "redirect_uri":   redirect_uri,
-                "appType":        "100",
+                "redirect_uri":   REDIRECT_URI,
+                "appType":        app_type,
                 "code_challenge": "",
-                "state":          "sample",
+                "state":          "sample_state",
                 "scope":          "",
                 "nonce":          "",
                 "response_type":  "code",
                 "create_cookie":  True,
             },
-            headers={"Authorization": f"Bearer {d3['data']['access_token']}"},
-            timeout=10)
+            headers={"Authorization": f"Bearer {access_token_step4}"},
+            timeout=15,
+            allow_redirects=False)   # don't follow redirect — we need the URL
+
+        # Fyers returns 308 with the auth_code in the redirect URL
+        if r4.status_code not in (200, 308):
+            return None, (
+                f"Step 5 (get auth code) failed — HTTP {r4.status_code}: {r4.text[:300]}\n"
+                f"Redirect URL in Fyers app dashboard must be exactly: {REDIRECT_URI}\n"
+                f"Go to myapi.fyers.in → Apps → your app → Edit → set Redirect URL"
+            )
+
         try:
             d4 = r4.json()
         except Exception:
-            return None, f"Step 4 bad response: {r4.text[:200]}"
-        if d4.get("s") != "ok":
+            return None, f"Step 5 bad response: {r4.text[:200]}"
+
+        if d4.get("s") not in ("ok", None) and r4.status_code != 308:
             return None, (
-                f"Step 4 failed: {d4}\n"
-                f"→ 'redirectUrl mismatch': set Redirect URL in Fyers app to exactly: {REDIRECT_URI}\n"
-                f"→ 'apptype mismatch': FYERS_CLIENT_ID must end in -100, e.g. ABCD1234-100"
+                f"Step 5 failed: {d4}\n"
+                f"→ 'redirectUrl mismatch': Redirect URL must be: {REDIRECT_URI}\n"
+                f"→ 'apptype mismatch': FYERS_CLIENT_ID must end in -100"
             )
 
-        # Extract auth_code from URL
-        data = d4.get("data", {})
-        url  = d4.get("Url", "") or data.get("url", "")
-        auth_code = (
-            data.get("auth_code")
-            or data.get("auth")
-            or parse_qs(urlparse(url).query).get("auth_code", [None])[0]
-        )
+        # Extract auth_code from the redirect URL
+        redirect_url = d4.get("Url", "") or d4.get("url", "")
+        if not redirect_url:
+            # Try Location header (for 308)
+            redirect_url = r4.headers.get("Location", "")
+        auth_code = parse_qs(urlparse(redirect_url).query).get("auth_code", [None])[0]
         if not auth_code:
-            return None, f"Step 4: no auth_code in response: {d4}"
+            return None, f"Step 5: no auth_code in response: {d4} | location: {redirect_url}"
 
-        # Step 5 — exchange auth_code for access_token via SHA-256 hash
-        # (new Fyers API v3 method — used by your friend's working code)
-        app_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
-        r5 = sess.post(
-            "https://api-t1.fyers.in/api/v3/validate-authcode",
-            json={
-                "grant_type": "authorization_code",
-                "appIdHash":  app_hash,
-                "code":       auth_code,
-            },
-            timeout=10)
-        try:
-            d5 = r5.json()
-        except Exception:
-            return None, f"Step 5 bad response: {r5.text[:200]}"
+        # ── Step 6: exchange auth code → access token via SessionModel ────────
+        # Using fyersModel.SessionModel.generate_token() — the proven working method
+        session = fyersModel.SessionModel(
+            client_id=client_id,
+            secret_key=secret_key,
+            redirect_uri=REDIRECT_URI,
+            response_type="code",
+            grant_type="authorization_code",
+        )
+        session.set_token(auth_code)
+        d5 = session.generate_token()
+
         token = d5.get("access_token")
-
         if not token:
-            # Fallback: legacy SessionModel (older Fyers SDK versions)
-            try:
-                s_model = fyersModel.SessionModel(
-                    client_id=client_id, secret_key=secret_key,
-                    redirect_uri=redirect_uri,
-                    response_type="code", grant_type="authorization_code")
-                s_model.set_token(auth_code)
-                d5b   = s_model.generate_token()
-                token = d5b.get("access_token")
-                if not token:
-                    return None, f"Step 5 both methods failed: {d5} / {d5b}"
-            except Exception as ex:
-                return None, f"Step 5 failed: {d5} / SDK: {ex}"
+            return None, f"Step 6 (generate token) failed: {d5}"
 
         return token, None
 
@@ -200,29 +212,25 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOKEN MANAGEMENT
-# Key insight: @st.cache_resource caches BOTH success AND failure.
-# So if login fails once, it gets stuck returning None forever until reboot.
-# Fix: cache only successful tokens; on failure, allow retry.
+# TOKEN CACHING
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def _cached_token(client_id, secret_key, username, pin, totp_key):
     """
-    Cached version — only called after validation passes.
-    Tries token file first, then TOTP login.
-    Returns (token, None) — ONLY caches successes.
+    Cached token generator.
+    IMPORTANT: raises RuntimeError on failure so @st.cache_resource does NOT
+    cache the error — next call will retry the login.
     """
-    # Try saved token file first (survives hot-reloads within same day)
+    # Try saved file first (survives hot-reloads within the same trading day)
     try:
         with open(TOKEN_FILE) as f:
             tok = f.read().strip()
         if tok and len(tok) > 20:
-            return tok, None
+            return tok
     except FileNotFoundError:
         pass
 
-    # Generate fresh token
     token, err = generate_token(client_id, secret_key, username, pin, totp_key)
     if token:
         try:
@@ -230,17 +238,14 @@ def _cached_token(client_id, secret_key, username, pin, totp_key):
                 f.write(token)
         except Exception:
             pass
-        return token, None
+        return token
 
-    # Return error WITHOUT caching — raise so @st.cache_resource doesn't store it
-    raise RuntimeError(err)
+    # Raise so the error is NOT cached — next call retries
+    raise RuntimeError(err or "Unknown login error")
 
 
 def get_token() -> str:
-    """
-    Public entry-point. Reads secrets in normal Streamlit context,
-    then calls cached generator. Raises on failure with clear message.
-    """
+    """Read secrets in Streamlit context, then call cached generator."""
     cid  = _s("FYERS_CLIENT_ID")
     sec  = _s("FYERS_SECRET_KEY")
     user = _s("FYERS_USERNAME")
@@ -254,21 +259,13 @@ def get_token() -> str:
     if missing:
         raise RuntimeError(
             f"Missing secrets: {', '.join(missing)}\n"
-            f"Add them in Streamlit Cloud → your app → ⋮ → Settings → Secrets.\n"
+            f"Add in Streamlit Cloud → app → ⋮ → Settings → Secrets.\n"
             f"Do NOT put secrets in any file on GitHub."
         )
-
-    try:
-        token, _ = _cached_token(cid, sec, user, pin, totp)
-        return token
-    except RuntimeError as e:
-        raise RuntimeError(str(e))
-    except Exception as e:
-        raise RuntimeError(f"Login failed: {e}")
+    return _cached_token(cid, sec, user, pin, totp)
 
 
 def get_fyers_client():
-    """Authenticated FyersModel, cached in session state."""
     if st.session_state.get("_fc"):
         return st.session_state._fc
     tok = get_token()
@@ -279,7 +276,7 @@ def get_fyers_client():
 
 
 def refresh_token():
-    """Force fresh login on next call."""
+    """Force re-login on next call."""
     _cached_token.clear()
     st.session_state.pop("_fc", None)
     try:
@@ -297,18 +294,16 @@ def refresh_token():
 
 @st.cache_resource
 def _fetch_expiry_map(token, cid, sym):
-    """{label: code} for all future expiries. Cached per (token, sym)."""
     try:
         fyers = fyersModel.FyersModel(client_id=cid, token=token, log_path="")
         resp  = fyers.optionchain(
             data={"symbol": sym, "strikecount": 1, "timestamp": ""})
         if not (resp and resp.get("s") == "ok"):
             return {}
-        raw    = resp.get("data", {}).get("expiryData", [])
+        raw = resp.get("data", {}).get("expiryData", [])
         parsed = []
         for e in raw:
-            if not isinstance(e, dict):
-                continue
+            if not isinstance(e, dict): continue
             try:
                 dd, mm, yy4 = e["date"].split("-")
                 dd, mm, yy4 = int(dd), int(mm), int(yy4)
@@ -371,7 +366,6 @@ def _dte(label: str, index: str = "") -> float:
     except Exception:
         return 30 / 365.0
 
-# alias for data_helpers
 _days_to_expiry = _dte
 
 
@@ -392,10 +386,8 @@ def get_strikes(index: str, expiry_label: str) -> list:
         if resp and resp.get("s") == "ok":
             strikes = set()
             for opt in resp.get("data", {}).get("optionsChain", []):
-                try:
-                    strikes.add(int(float(opt["strikePrice"])))
-                except Exception:
-                    pass
+                try: strikes.add(int(float(opt["strikePrice"])))
+                except Exception: pass
             if strikes:
                 result = sorted(strikes)
                 st.session_state[ck] = result
@@ -465,11 +457,11 @@ def _quote(symbol: str) -> dict:
     v   = resp["d"][0]["v"]
     ltp = float(v.get("lp", 0))
     return {"ltp": ltp,
-            "bid": float(v.get("bid",             ltp * 0.998)),
-            "ask": float(v.get("ask",             ltp * 1.002)),
+            "bid": float(v.get("bid",              ltp * 0.998)),
+            "ask": float(v.get("ask",              ltp * 1.002)),
             "prev_close": float(v.get("prev_close_price", 0)),
-            "high": float(v.get("high_price",     ltp)),
-            "low":  float(v.get("low_price",      ltp))}
+            "high": float(v.get("high_price",      ltp)),
+            "low":  float(v.get("low_price",       ltp))}
 
 def get_live_quote(index, strike, expiry_label, cp) -> dict:
     _validate_leg(index, strike, expiry_label, cp)
@@ -494,10 +486,10 @@ def get_spot_price(index: str) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _validate_leg(index, strike, expiry, cp):
-    if not index:             raise ValueError("Index not selected.")
-    if not expiry:            raise ValueError(f"Expiry not selected for {index}.")
+    if not index:                 raise ValueError("Index not selected.")
+    if not expiry:                raise ValueError(f"Expiry not selected for {index}.")
     if not strike or strike <= 0: raise ValueError(f"Invalid strike {strike}.")
-    if cp not in ("CE","PE"): raise ValueError(f"cp must be CE or PE, got {cp}.")
+    if cp not in ("CE", "PE"):    raise ValueError(f"cp must be CE or PE, got {cp}.")
 
 def validate_legs(legs: list):
     if not legs: raise ValueError("No legs.")
@@ -585,8 +577,8 @@ def get_spread_greeks(legs, spots):
             ltp = get_live_ltp(leg["index"], leg["strike"], leg["expiry"], leg["cp"])
             sig = implied_volatility(ltp, S, K, T, RISK_FREE_RATE, leg["cp"])
             g   = bs_greeks(S, K, T, RISK_FREE_RATE, sig, leg["cp"])
-            sgn = 1 if leg["bs"] == "Buy" else -1; r = leg["ratio"]
-            for k in ("delta","gamma","vega","theta"): net[k] += sgn*r*g[k]
+            sgn = 1 if leg["bs"] == "Buy" else -1; ratio = leg["ratio"]
+            for k in ("delta","gamma","vega","theta"): net[k] += sgn*ratio*g[k]
             net["ivs"].append(g["iv"])
         except Exception: pass
     return {"delta":round(net["delta"],4),"gamma":round(net["gamma"],6),
