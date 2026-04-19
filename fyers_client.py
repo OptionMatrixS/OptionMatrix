@@ -1,45 +1,22 @@
 """
-fyers_client.py  —  Option Matrix
-===================================
-Fyers API v3 TOTP auto-login.
-
-This uses the EXACT same login flow as the working dashboard.py 
-shared by your friend (document index 4 in this conversation).
-
-Critical details that must match:
-  - send_login_otp_v2  +  fy_id BASE64 encoded
-  - verify_otp
-  - verify_pin_v2      +  identifier BASE64 encoded
-  - /api/v3/token      (check status 308, extract auth_code from Url)
-  - SessionModel.generate_token()  (NOT validate-authcode)
-
-Streamlit secrets required (Settings → Secrets in Streamlit Cloud):
-  FYERS_CLIENT_ID  = "XXXX-100"
-  FYERS_SECRET_KEY = "your_secret_key"
-  FYERS_USERNAME   = "XY12345"
-  FYERS_PIN        = "1234"
-  FYERS_TOTP_KEY   = "BASE32TOTPSECRET"
-
-Redirect URL must EXACTLY match what is in myapi.fyers.in → Apps → your app:
-  REDIRECT_URI = "http://127.0.0.1:8080/"
+fyers_client.py — Option Matrix
+Fyers auth copied EXACTLY from friend's working _get_access_token() in Doc 36.
 """
 
-import os, base64, math
+import os, base64, hashlib, math
 import streamlit as st
 import pandas as pd
 import requests as _req
 import pyotp
 from datetime import datetime, date
 from collections import defaultdict
-from urllib.parse import parse_qs, urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 from fyers_apiv3 import fyersModel
 
-# ─── Constants ────────────────────────────────────────────────────────────────
 REDIRECT_URI   = "http://127.0.0.1:8080/"
 TOKEN_FILE     = "fyers_token.txt"
 RISK_FREE_RATE = 0.065
-_MONTHS        = ["JAN","FEB","MAR","APR","MAY","JUN",
-                  "JUL","AUG","SEP","OCT","NOV","DEC"]
+_MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 _UNDERLYING_SYM = {
     "SENSEX":     "BSE:SENSEX-INDEX",
     "BANKEX":     "BSE:BANKEX-INDEX",
@@ -49,12 +26,8 @@ _UNDERLYING_SYM = {
     "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ─── Secrets ──────────────────────────────────────────────────────────────────
 def _s(key: str) -> str:
-    """Read secret from Streamlit Cloud secrets or env var."""
     try:
         if key in st.secrets:
             return str(st.secrets[key]).strip()
@@ -62,181 +35,114 @@ def _s(key: str) -> str:
         pass
     return os.environ.get(key, "").strip()
 
-def _b64(value) -> str:
-    """Base64 encode a value — used for fy_id and pin."""
-    return base64.b64encode(str(value).encode()).decode()
+def _b64(v) -> str:
+    return base64.b64encode(str(v).encode()).decode()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOKEN GENERATION — exact copy of friend's working dashboard.py flow
+# AUTH — copied EXACTLY from friend's _get_access_token (Doc 36)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_token(client_id, secret_key, username, pin, totp_key):
+@st.cache_resource(ttl=3600)
+def _get_access_token(client_id: str, secret_key: str,
+                      username: str, pin: str, totp_key: str) -> str:
     """
-    Generates Fyers access token via TOTP.
-    This is the EXACT same flow as the working friend dashboard.py.
-    All args passed explicitly — safe to call from @st.cache_resource.
-    Returns (access_token, None) or (None, error_string).
+    Friend's exact working code from Doc 36.
+    ttl=3600 — refreshes every hour automatically.
+    Raises RuntimeError on failure (so Streamlit does NOT cache the error).
     """
-    redirect_uri = REDIRECT_URI
+    s = _req.Session()
 
-    try:
-        s = _req.Session()
+    # Step 1: send_login_otp_v2 — b64 encoded fy_id
+    r1 = s.post("https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
+                json={"fy_id": _b64(username), "app_id": "2"}, timeout=10)
+    if r1.status_code == 429:
+        raise RuntimeError("Rate limited by Fyers (429). Wait ~60s and click Refresh Token.")
+    r1d = r1.json()
+    if r1d.get("s") != "ok":
+        raise RuntimeError(f"Step 1 failed: {r1d}")
 
-        # ── Step 1: Send login OTP ────────────────────────────────────────────
-        # Uses v2 endpoint + fy_id BASE64 encoded (same as friend's code)
-        r1 = s.post(
-            "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
-            json={"fy_id": _b64(username), "app_id": "2"},
-            timeout=15)
-
-        if r1.status_code == 429:
-            return None, "Rate limited (HTTP 429). Wait 60 seconds then click Refresh Token."
-        try:
-            d1 = r1.json()
-        except Exception:
-            return None, f"Step 1 bad response (HTTP {r1.status_code}): {r1.text[:200]}"
-        if d1.get("s") != "ok":
-            return None, f"Step 1 (send OTP) failed: {d1}"
-
-        # ── Step 2: Verify TOTP ───────────────────────────────────────────────
-        totp_code = pyotp.TOTP(totp_key).now()
-        r2 = s.post(
-            "https://api-t2.fyers.in/vagator/v2/verify_otp",
-            json={"request_key": d1["request_key"], "otp": totp_code},
-            timeout=15)
-        try:
-            d2 = r2.json()
-        except Exception:
-            return None, f"Step 2 bad response: {r2.text[:200]}"
-        if d2.get("s") != "ok":
-            return None, (
-                f"Step 2 (verify TOTP) failed: {d2}\n"
-                "FYERS_TOTP_KEY must be the long Base32 secret shown during TOTP setup, "
-                "NOT the 6-digit code that changes every 30 seconds."
-            )
-
-        # ── Step 3: Verify PIN ────────────────────────────────────────────────
-        # Uses verify_pin_v2 + identifier BASE64 encoded (same as friend's code)
-        r3 = s.post(
-            "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
-            json={
-                "request_key":   d2["request_key"],
-                "identity_type": "pin",
-                "identifier":    _b64(pin),   # BASE64 encoded — same as friend
-            },
-            timeout=15)
-        try:
-            d3 = r3.json()
-        except Exception:
-            return None, f"Step 3 bad response: {r3.text[:200]}"
-        if d3.get("s") != "ok":
-            return None, (
-                f"Step 3 (verify PIN) failed: {d3}\n"
-                "Check FYERS_PIN — it must be your 4-digit Fyers login PIN."
-            )
-
-        access_token_step3 = d3["data"]["access_token"]
-
-        # ── Step 4: Get auth code ─────────────────────────────────────────────
-        # This returns HTTP 308 with auth_code in the redirect Url
-        app_id = client_id.split("-")[0]   # "ABCD1234-100" → "ABCD1234"
-        r4 = s.post(
-            "https://api-t1.fyers.in/api/v3/token",
-            json={
-                "fyers_id":       username,
-                "app_id":         app_id,
-                "redirect_uri":   redirect_uri,
-                "appType":        "100",
-                "code_challenge": "",
-                "state":          "sample",
-                "scope":          "",
-                "nonce":          "",
-                "response_type":  "code",
-                "create_cookie":  True,
-            },
-            headers={"Authorization": f"Bearer {access_token_step3}"},
-            timeout=15,
-            allow_redirects=False)   # must NOT follow redirect
-
-        try:
-            d4 = r4.json()
-        except Exception:
-            return None, f"Step 4 bad response (HTTP {r4.status_code}): {r4.text[:200]}"
-
-        # Status 308 = redirect with auth_code
-        if r4.status_code not in (200, 308):
-            return None, (
-                f"Step 4 (get auth code) HTTP {r4.status_code}: {d4}\n"
-                f"Redirect URL in Fyers app dashboard must be exactly: {redirect_uri}\n"
-                f"Go to myapi.fyers.in → Apps → your app → Edit → Redirect URL"
-            )
-
-        if d4.get("s") not in ("ok", None):
-            return None, (
-                f"Step 4 failed: {d4}\n"
-                f"'redirectUrl mismatch' → set Redirect URL to: {redirect_uri}\n"
-                f"'apptype mismatch' → FYERS_CLIENT_ID must end in -100"
-            )
-
-        # Extract auth_code from Url field
-        redirect_url = (d4.get("Url") or d4.get("url") or
-                        r4.headers.get("Location", ""))
-        auth_code = parse_qs(urlparse(redirect_url).query).get("auth_code", [None])[0]
-        if not auth_code:
-            return None, f"Step 4: no auth_code found. Response: {d4}"
-
-        # ── Step 5: Exchange auth_code for access token ───────────────────────
-        # Using SessionModel.generate_token() — same as friend's working code
-        session = fyersModel.SessionModel(
-            client_id=client_id,
-            secret_key=secret_key,
-            redirect_uri=redirect_uri,
-            response_type="code",
-            grant_type="authorization_code",
+    # Step 2: verify_otp — TOTP code
+    totp = pyotp.TOTP(totp_key).now()
+    r2 = s.post("https://api-t2.fyers.in/vagator/v2/verify_otp",
+                json={"request_key": r1d["request_key"], "otp": totp}, timeout=10)
+    r2d = r2.json()
+    if r2d.get("s") != "ok":
+        raise RuntimeError(
+            f"Step 2 failed: {r2d}\n"
+            "FYERS_TOTP_KEY must be the long Base32 secret (e.g. JBSWY3DPEHPK3PXP), "
+            "NOT the 6-digit code."
         )
-        session.set_token(auth_code)
-        d5 = session.generate_token()
 
-        token = d5.get("access_token")
-        if not token:
-            return None, f"Step 5 (generate token) failed: {d5}"
+    # Step 3: verify_pin_v2 — b64 encoded pin (EXACTLY as friend's code)
+    r3 = s.post("https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
+                json={"request_key": r2d["request_key"],
+                      "identity_type": "pin",
+                      "identifier": _b64(pin)},   # b64 — same as friend
+                timeout=10)
+    r3d = r3.json()
+    if r3d.get("s") != "ok":
+        raise RuntimeError(
+            f"Step 3 failed: {r3d}\n"
+            "Check FYERS_PIN is your 4-digit Fyers login PIN."
+        )
+    access_token_stage1 = r3d["data"]["access_token"]
 
-        return token, None
+    # Step 4: get auth_code — friend checks s == "ok" (NOT status 308)
+    app_id = client_id.split("-")[0]
+    r4 = s.post("https://api-t1.fyers.in/api/v3/token", json={
+        "fyers_id": username, "app_id": app_id,
+        "redirect_uri": REDIRECT_URI, "appType": "100",
+        "code_challenge": "", "state": "sample",
+        "scope": "", "nonce": "", "response_type": "code", "create_cookie": True,
+    }, headers={"Authorization": f"Bearer {access_token_stage1}"}, timeout=10)
+    r4d = r4.json()
+    if r4d.get("s") != "ok":
+        raise RuntimeError(
+            f"Step 4 failed: {r4d}\n"
+            f"→ 'redirectUrl mismatch': Redirect URL in myapi.fyers.in must be: {REDIRECT_URI}\n"
+            f"→ 'apptype mismatch': FYERS_CLIENT_ID must end in -100 e.g. ABCD1234-100"
+        )
 
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+    # Extract auth_code — friend's exact multi-location extraction
+    data = r4d.get("data", {})
+    auth_code = (
+        data.get("auth")
+        or parse_qs(urlparse(r4d.get("Url", "")).query).get("auth_code", [None])[0]
+        or parse_qs(urlparse(data.get("url", "")).query).get("auth_code", [None])[0]
+    )
+    if not auth_code:
+        raise RuntimeError(f"Step 4: no auth_code in response: {r4d}")
 
+    # Step 5: validate-authcode with SHA-256 hash — friend's method
+    app_id_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
+    r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
+        "grant_type": "authorization_code",
+        "appIdHash":  app_id_hash,
+        "code":       auth_code,
+    }, timeout=10)
+    r5d   = r5.json()
+    token = r5d.get("access_token")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOKEN CACHING
-# Raises RuntimeError on failure so @st.cache_resource does NOT cache the error
-# ─────────────────────────────────────────────────────────────────────────────
-
-@st.cache_resource
-def _cached_token(client_id, secret_key, username, pin, totp_key):
-    # Try saved token file first (survives hot-reloads)
-    try:
-        with open(TOKEN_FILE) as f:
-            tok = f.read().strip()
-        if tok and len(tok) > 20:
-            return tok
-    except FileNotFoundError:
-        pass
-
-    token, err = generate_token(client_id, secret_key, username, pin, totp_key)
-    if token:
+    if not token:
+        # Fallback: SessionModel (friend also has this fallback)
         try:
-            with open(TOKEN_FILE, "w") as f:
-                f.write(token)
-        except Exception:
-            pass
-        return token
+            session = fyersModel.SessionModel(
+                client_id=client_id, secret_key=secret_key,
+                redirect_uri=REDIRECT_URI, response_type="code",
+                grant_type="authorization_code")
+            session.set_token(auth_code)
+            r5d2  = session.generate_token()
+            token = r5d2.get("access_token")
+        except Exception as e:
+            raise RuntimeError(f"Step 5 both methods failed: {r5d} / SDK: {e}")
+        if not token:
+            raise RuntimeError(f"Step 5 both methods failed: {r5d} / {r5d2}")
 
-    raise RuntimeError(err or "Unknown Fyers login error")
+    return token
 
 
 def get_token() -> str:
-    """Entry point — reads secrets in Streamlit context, calls cached generator."""
+    """Read secrets in Streamlit context, call cached auth."""
     cid  = _s("FYERS_CLIENT_ID")
     sec  = _s("FYERS_SECRET_KEY")
     user = _s("FYERS_USERNAME")
@@ -249,11 +155,10 @@ def get_token() -> str:
     }.items() if not v]
     if missing:
         raise RuntimeError(
-            f"Missing Fyers secrets: {', '.join(missing)}\n"
-            f"Add them in Streamlit Cloud → your app → ⋮ → Settings → Secrets.\n"
-            f"Do NOT put secrets in any file on GitHub."
+            f"Missing secrets: {', '.join(missing)}\n"
+            "Add in Streamlit Cloud → ⋮ → Settings → Secrets"
         )
-    return _cached_token(cid, sec, user, pin, totp)
+    return _get_access_token(cid, sec, user, pin, totp)
 
 
 def get_fyers_client():
@@ -261,34 +166,28 @@ def get_fyers_client():
         return st.session_state._fc
     tok = get_token()
     cid = _s("FYERS_CLIENT_ID")
-    fc  = fyersModel.FyersModel(client_id=cid, token=tok, log_path="")
+    fc  = fyersModel.FyersModel(client_id=cid, is_async=False, token=tok, log_path="")
     st.session_state._fc = fc
     return fc
 
 
 def refresh_token():
-    """Force re-login on next call."""
-    _cached_token.clear()
+    _get_access_token.clear()
     st.session_state.pop("_fc", None)
-    try:
-        os.remove(TOKEN_FILE)
-    except FileNotFoundError:
-        pass
     for k in list(st.session_state.keys()):
         if k.startswith("expiries_") or k.startswith("strikes_"):
             del st.session_state[k]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXPIRIES
+# EXPIRIES — copied from friend's _fetch_expiries_from_fyers
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def _fetch_expiry_map(token, cid, sym):
     try:
         fyers = fyersModel.FyersModel(client_id=cid, token=token, log_path="")
-        resp  = fyers.optionchain(
-            data={"symbol": sym, "strikecount": 1, "timestamp": ""})
+        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 1, "timestamp": ""})
         if not (resp and resp.get("s") == "ok"):
             return {}
         raw = resp.get("data", {}).get("expiryData", [])
@@ -325,9 +224,7 @@ def get_expiries(index: str) -> list:
     sym  = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
     data = _fetch_expiry_map(tok, cid, sym)
     if not data:
-        raise ValueError(
-            f"No expiries from Fyers for {index}. "
-            "Token may be expired — click Refresh Token in sidebar.")
+        raise ValueError(f"No expiries from Fyers for {index}. Token may be expired.")
     st.session_state[ck] = data
     return list(data.keys())
 
@@ -342,16 +239,14 @@ def _code_to_date(code: str) -> date:
     mmap = {m: i+1 for i, m in enumerate(_MONTHS)}
     if any(c.isalpha() for c in code):
         yy = int(code[:2]); mon = code[2:5]; mm = mmap[mon]
-        dd = calendar.monthrange(2000+yy, mm)[1]
-        return date(2000+yy, mm, dd)
+        return date(2000+yy, mm, calendar.monthrange(2000+yy, mm)[1])
     return date(2000+int(code[:2]), int(code[2:4]), int(code[4:6]))
 
 
 def _dte(label: str, index: str = "") -> float:
     try:
         code = _label_to_code(index, label) if index else label
-        days = (_code_to_date(code) - datetime.now().date()).days
-        return max(days, 1) / 365.0
+        return max((_code_to_date(code) - datetime.now().date()).days, 1) / 365.0
     except Exception:
         return 30 / 365.0
 
@@ -365,22 +260,18 @@ _days_to_expiry = _dte
 def get_strikes(index: str, expiry_label: str) -> list:
     code = _label_to_code(index, expiry_label)
     ck   = f"strikes_{index}_{code}"
-    if st.session_state.get(ck):
-        return st.session_state[ck]
+    if st.session_state.get(ck): return st.session_state[ck]
     try:
         fyers = get_fyers_client()
         sym   = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
-        resp  = fyers.optionchain(
-            data={"symbol": sym, "strikecount": 50, "timestamp": ""})
+        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 50, "timestamp": ""})
         if resp and resp.get("s") == "ok":
-            strikes = set()
-            for opt in resp.get("data", {}).get("optionsChain", []):
-                try: strikes.add(int(float(opt["strikePrice"])))
-                except Exception: pass
+            strikes = sorted({int(float(o["strikePrice"]))
+                              for o in resp.get("data",{}).get("optionsChain",[])
+                              if isinstance(o, dict)})
             if strikes:
-                result = sorted(strikes)
-                st.session_state[ck] = result
-                return result
+                st.session_state[ck] = strikes
+                return strikes
     except Exception:
         pass
     atm  = {"NIFTY": 22800, "SENSEX": 82500, "BANKNIFTY": 48000}.get(index, 22800)
@@ -389,21 +280,21 @@ def get_strikes(index: str, expiry_label: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SYMBOL BUILDER
+# SYMBOL BUILDER — friend's exact build_option_symbol logic
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_symbol(index: str, expiry_label: str, cp: str, strike: int) -> str:
     exch = "BSE" if index in ("SENSEX", "BANKEX") else "NSE"
     code = _label_to_code(index, expiry_label).strip().upper()
     ot   = "CE" if cp.upper() in ("CE", "C") else "PE"
-    if any(c.isalpha() for c in code):
+    if any(c.isalpha() for c in code):         # monthly e.g. 26MAY
         return f"{exch}:{index}{code}{ot}{strike}"
-    yy, mm, dd = code[:2], str(int(code[2:4])), code[4:6]
+    yy, mm, dd = code[:2], str(int(code[2:4])), code[4:6]  # weekly → remove leading zero
     return f"{exch}:{index}{yy}{mm}{dd}{ot}{strike}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CANDLES
+# CANDLES — same as friend's fetch_ohlc_live
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_candles(symbol: str, interval=1, date_str=None) -> pd.DataFrame:
@@ -416,12 +307,9 @@ def _fetch_candles(symbol: str, interval=1, date_str=None) -> pd.DataFrame:
         "range_to": date_str, "cont_flag": "1"})
     if resp.get("s") != "ok" or not resp.get("candles"):
         return pd.DataFrame()
-    df = pd.DataFrame(resp["candles"],
-                      columns=["ts","open","high","low","close","volume"])
+    df = pd.DataFrame(resp["candles"], columns=["ts","open","high","low","close","volume"])
     df["time"] = (pd.to_datetime(df["ts"], unit="s")
-                  .dt.tz_localize("UTC")
-                  .dt.tz_convert("Asia/Kolkata")
-                  .dt.tz_localize(None))
+                  .dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata").dt.tz_localize(None))
     return df.drop(columns=["ts"]).set_index("time")
 
 
@@ -430,7 +318,7 @@ def _get_candles(index, strike, expiry_label, cp, interval=1, date_str=None):
     sym = build_symbol(index, expiry_label, cp, strike)
     df  = _fetch_candles(sym, interval, date_str)
     if df.empty:
-        raise ValueError(f"No data for {sym}. Check date is a trading day.")
+        raise ValueError(f"No data for {sym}. Check the date is a trading day.")
     return df
 
 
@@ -443,31 +331,18 @@ def _quote(symbol: str) -> dict:
     resp  = fyers.quotes(data={"symbols": symbol})
     if resp.get("s") != "ok":
         raise ValueError(f"Quote failed for {symbol}: {resp}")
-    v   = resp["d"][0]["v"]
-    ltp = float(v.get("lp", 0))
-    return {"ltp": ltp,
-            "bid": float(v.get("bid",              ltp * 0.998)),
-            "ask": float(v.get("ask",              ltp * 1.002)),
+    v = resp["d"][0]["v"]; ltp = float(v.get("lp", 0))
+    return {"ltp": ltp, "bid": float(v.get("bid", ltp*.998)),
+            "ask": float(v.get("ask", ltp*1.002)),
             "prev_close": float(v.get("prev_close_price", 0)),
-            "high": float(v.get("high_price",      ltp)),
-            "low":  float(v.get("low_price",       ltp))}
+            "high": float(v.get("high_price", ltp)), "low": float(v.get("low_price", ltp))}
 
-def get_live_quote(index, strike, expiry_label, cp) -> dict:
-    _validate_leg(index, strike, expiry_label, cp)
-    return _quote(build_symbol(index, expiry_label, cp, strike))
-
-def get_live_ltp(index, strike, expiry_label, cp) -> float:
-    return get_live_quote(index, strike, expiry_label, cp)["ltp"]
-
-def get_live_bid_ask_ltp(index, strike, expiry_label, cp) -> tuple:
-    q = get_live_quote(index, strike, expiry_label, cp)
-    return q["bid"], q["ask"], q["ltp"]
-
+def get_live_quote(i, s, e, c):    _validate_leg(i,s,e,c); return _quote(build_symbol(i,e,c,s))
+def get_live_ltp(i, s, e, c):      return get_live_quote(i,s,e,c)["ltp"]
+def get_live_bid_ask_ltp(i,s,e,c): q=get_live_quote(i,s,e,c); return q["bid"],q["ask"],q["ltp"]
 def get_spot_price(index: str) -> float:
-    try:
-        return _quote(_UNDERLYING_SYM.get(index, f"NSE:{index}-INDEX"))["ltp"]
-    except Exception:
-        return {"NIFTY": 22800, "SENSEX": 82500, "BANKNIFTY": 48000}.get(index, 22800)
+    try:    return _quote(_UNDERLYING_SYM.get(index, f"NSE:{index}-INDEX"))["ltp"]
+    except: return {"NIFTY":22800,"SENSEX":82500,"BANKNIFTY":48000}.get(index,22800)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,16 +353,13 @@ def _validate_leg(index, strike, expiry, cp):
     if not index:                 raise ValueError("Index not selected.")
     if not expiry:                raise ValueError(f"Expiry not selected for {index}.")
     if not strike or strike <= 0: raise ValueError(f"Invalid strike {strike}.")
-    if cp not in ("CE", "PE"):    raise ValueError(f"cp must be CE or PE, got {cp}.")
+    if cp not in ("CE","PE"):     raise ValueError(f"cp must be CE or PE.")
 
-def validate_legs(legs: list):
+def validate_legs(legs):
     if not legs: raise ValueError("No legs.")
     for i, leg in enumerate(legs):
-        try:
-            _validate_leg(leg.get("index",""), leg.get("strike",0),
-                          leg.get("expiry",""), leg.get("cp",""))
-        except ValueError as e:
-            raise ValueError(f"Leg {i+1}: {e}")
+        try: _validate_leg(leg.get("index",""),leg.get("strike",0),leg.get("expiry",""),leg.get("cp",""))
+        except ValueError as e: raise ValueError(f"Leg {i+1}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -498,21 +370,17 @@ def get_live_spread_ohlcv(legs, interval=1, date_str=None) -> pd.DataFrame:
     validate_legs(legs)
     spread = base = None
     for leg in legs:
-        df    = _get_candles(leg["index"], leg["strike"],
-                              leg["expiry"], leg["cp"], interval, date_str)
+        df    = _get_candles(leg["index"],leg["strike"],leg["expiry"],leg["cp"],interval,date_str)
         price = df["close"] * leg["ratio"]
         price = price if leg["bs"] == "Buy" else -price
-        if spread is None:
-            spread, base = price, df.index
-        else:
-            spread = spread.reindex(base).add(price.reindex(base), fill_value=0)
+        if spread is None: spread, base = price, df.index
+        else: spread = spread.reindex(base).add(price.reindex(base), fill_value=0)
     out = pd.DataFrame({"close": spread.values}, index=base)
-    out["open"]  = out["close"].shift(1).fillna(out["close"])
-    out["high"]  = out[["open","close"]].max(axis=1)
-    out["low"]   = out[["open","close"]].min(axis=1)
+    out["open"] = out["close"].shift(1).fillna(out["close"])
+    out["high"] = out[["open","close"]].max(axis=1)
+    out["low"]  = out[["open","close"]].min(axis=1)
     out = out.reset_index()
-    if "index" in out.columns:
-        out = out.rename(columns={"index": "time"})
+    if "index" in out.columns: out = out.rename(columns={"index":"time"})
     return out
 
 
@@ -520,54 +388,42 @@ def get_live_spread_ohlcv(legs, interval=1, date_str=None) -> pd.DataFrame:
 # BLACK-SCHOLES
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _ncdf(x):
-    return (1 + math.erf(x / math.sqrt(2))) / 2
+def _ncdf(x): return (1+math.erf(x/math.sqrt(2)))/2
+def _npdf(x): return math.exp(-.5*x*x)/math.sqrt(2*math.pi)
 
-def _npdf(x):
-    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+def bs_price(S,K,T,r,sig,cp):
+    if T<=0 or sig<=0: return max(0.,(S-K) if cp=="CE" else (K-S))
+    d1=(math.log(S/K)+(r+.5*sig**2)*T)/(sig*math.sqrt(T)); d2=d1-sig*math.sqrt(T)
+    return S*_ncdf(d1)-K*math.exp(-r*T)*_ncdf(d2) if cp=="CE" else K*math.exp(-r*T)*_ncdf(-d2)-S*_ncdf(-d1)
 
-def bs_price(S, K, T, r, sig, cp):
-    if T <= 0 or sig <= 0:
-        return max(0., (S-K) if cp == "CE" else (K-S))
-    d1 = (math.log(S/K) + (r + 0.5*sig**2)*T) / (sig*math.sqrt(T))
-    d2 = d1 - sig*math.sqrt(T)
-    return (S*_ncdf(d1) - K*math.exp(-r*T)*_ncdf(d2) if cp == "CE"
-            else K*math.exp(-r*T)*_ncdf(-d2) - S*_ncdf(-d1))
-
-def implied_volatility(mp, S, K, T, r, cp):
-    if mp <= 0 or S <= 0 or K <= 0 or T <= 0: return 0.
-    lo, hi = 0.001, 5.
+def implied_volatility(mp,S,K,T,r,cp):
+    if mp<=0 or S<=0 or K<=0 or T<=0: return 0.
+    lo,hi=.001,5.
     for _ in range(200):
-        mid = (lo + hi) / 2; p = bs_price(S, K, T, r, mid, cp)
-        if abs(p - mp) < 1e-5: return mid
-        lo, hi = (mid, hi) if p < mp else (lo, mid)
+        mid=(lo+hi)/2; p=bs_price(S,K,T,r,mid,cp)
+        if abs(p-mp)<1e-5: return mid
+        lo,hi=(mid,hi) if p<mp else (lo,mid)
     return mid
 
-def bs_greeks(S, K, T, r, sig, cp):
-    if T <= 0 or sig <= 0:
-        return {"delta":0,"gamma":0,"vega":0,"theta":0,"iv":sig*100}
-    d1  = (math.log(S/K)+(r+0.5*sig**2)*T)/(sig*math.sqrt(T))
-    d2  = d1 - sig*math.sqrt(T)
-    pdf = _npdf(d1); g = pdf/(S*sig*math.sqrt(T)); v = S*pdf*math.sqrt(T)/100
-    d   = _ncdf(d1) if cp == "CE" else _ncdf(d1) - 1
-    t   = (-(S*pdf*sig)/(2*math.sqrt(T)) +
-           (-r*K*math.exp(-r*T)*_ncdf(d2) if cp == "CE"
-            else r*K*math.exp(-r*T)*_ncdf(-d2))) / 365
-    return {"delta":round(d,4),"gamma":round(g,6),
-            "vega":round(v,4),"theta":round(t,4),"iv":round(sig*100,2)}
+def bs_greeks(S,K,T,r,sig,cp):
+    if T<=0 or sig<=0: return {"delta":0,"gamma":0,"vega":0,"theta":0,"iv":sig*100}
+    d1=(math.log(S/K)+(r+.5*sig**2)*T)/(sig*math.sqrt(T)); d2=d1-sig*math.sqrt(T)
+    pdf=_npdf(d1); g=pdf/(S*sig*math.sqrt(T)); v=S*pdf*math.sqrt(T)/100
+    d=_ncdf(d1) if cp=="CE" else _ncdf(d1)-1
+    t=(-(S*pdf*sig)/(2*math.sqrt(T))+(-r*K*math.exp(-r*T)*_ncdf(d2) if cp=="CE" else r*K*math.exp(-r*T)*_ncdf(-d2)))/365
+    return {"delta":round(d,4),"gamma":round(g,6),"vega":round(v,4),"theta":round(t,4),"iv":round(sig*100,2)}
 
-def get_spread_greeks(legs, spots):
-    validate_legs(legs)
-    net = {"delta":0.,"gamma":0.,"vega":0.,"theta":0.,"ivs":[]}
+def get_spread_greeks(legs,spots):
+    validate_legs(legs); net={"delta":0.,"gamma":0.,"vega":0.,"theta":0.,"ivs":[]}
     for leg in legs:
         try:
-            S   = float(spots.get(leg["index"], 22800)); K = float(leg["strike"])
-            T   = _dte(leg["expiry"], leg["index"])
-            ltp = get_live_ltp(leg["index"], leg["strike"], leg["expiry"], leg["cp"])
-            sig = implied_volatility(ltp, S, K, T, RISK_FREE_RATE, leg["cp"])
-            g   = bs_greeks(S, K, T, RISK_FREE_RATE, sig, leg["cp"])
-            sgn = 1 if leg["bs"] == "Buy" else -1; ratio = leg["ratio"]
-            for k in ("delta","gamma","vega","theta"): net[k] += sgn*ratio*g[k]
+            S=float(spots.get(leg["index"],22800)); K=float(leg["strike"])
+            T=_dte(leg["expiry"],leg["index"])
+            ltp=get_live_ltp(leg["index"],leg["strike"],leg["expiry"],leg["cp"])
+            sig=implied_volatility(ltp,S,K,T,RISK_FREE_RATE,leg["cp"])
+            g=bs_greeks(S,K,T,RISK_FREE_RATE,sig,leg["cp"])
+            sgn=1 if leg["bs"]=="Buy" else -1; ratio=leg["ratio"]
+            for k in ("delta","gamma","vega","theta"): net[k]+=sgn*ratio*g[k]
             net["ivs"].append(g["iv"])
         except Exception: pass
     return {"delta":round(net["delta"],4),"gamma":round(net["gamma"],6),
@@ -576,32 +432,27 @@ def get_spread_greeks(legs, spots):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IV SERIES  /  MULTIPLIER
+# IV SERIES / MULTIPLIER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_iv_series_live(index, strike, expiry_label, cp, tf_minutes=5, date_str=None):
-    _validate_leg(index, strike, expiry_label, cp)
-    df   = _get_candles(index, strike, expiry_label, cp, tf_minutes, date_str)
-    spot = get_spot_price(index); T = _dte(expiry_label, index); rows = []
-    for ts, row in df.iterrows():
-        try: iv = implied_volatility(row["close"], spot, strike, T, RISK_FREE_RATE, cp)
-        except Exception: iv = 0.
-        rows.append({"time": ts, "iv_pct": round(iv*100, 2)})
+def get_iv_series_live(index,strike,expiry_label,cp,tf_minutes=5,date_str=None):
+    _validate_leg(index,strike,expiry_label,cp)
+    df=_get_candles(index,strike,expiry_label,cp,tf_minutes,date_str)
+    spot=get_spot_price(index); T=_dte(expiry_label,index); rows=[]
+    for ts,row in df.iterrows():
+        try: iv=implied_volatility(row["close"],spot,strike,T,RISK_FREE_RATE,cp)
+        except: iv=0.
+        rows.append({"time":ts,"iv_pct":round(iv*100,2)})
     return pd.DataFrame(rows)
 
-def get_multiplier_series_live(sx_strike, sx_expiry, n_strike, n_expiry,
-                                interval=1, date_str=None):
-    for i, s, e, c in [("SENSEX",sx_strike,sx_expiry,"CE"),
-                        ("SENSEX",sx_strike,sx_expiry,"PE"),
-                        ("NIFTY", n_strike, n_expiry, "CE"),
-                        ("NIFTY", n_strike, n_expiry, "PE")]:
-        _validate_leg(i, s, e, c)
-    sx_ce = _get_candles("SENSEX",sx_strike,sx_expiry,"CE",interval,date_str)["close"]
-    sx_pe = _get_candles("SENSEX",sx_strike,sx_expiry,"PE",interval,date_str)["close"]
-    n_ce  = _get_candles("NIFTY", n_strike, n_expiry, "CE",interval,date_str)["close"]
-    n_pe  = _get_candles("NIFTY", n_strike, n_expiry, "PE",interval,date_str)["close"]
-    sx_s  = sx_strike + sx_ce - sx_pe; n_s = n_strike + n_ce - n_pe
-    mult  = (sx_s / n_s).round(4)
-    return pd.DataFrame({"time": sx_s.index, "multiplier": mult.values,
-                         "sx_synth": sx_s.values.round(2),
-                         "n_synth": n_s.values.round(2)}).reset_index(drop=True)
+def get_multiplier_series_live(sx_strike,sx_expiry,n_strike,n_expiry,interval=1,date_str=None):
+    for i,s,e,c in [("SENSEX",sx_strike,sx_expiry,"CE"),("SENSEX",sx_strike,sx_expiry,"PE"),
+                    ("NIFTY",n_strike,n_expiry,"CE"),("NIFTY",n_strike,n_expiry,"PE")]:
+        _validate_leg(i,s,e,c)
+    sx_ce=_get_candles("SENSEX",sx_strike,sx_expiry,"CE",interval,date_str)["close"]
+    sx_pe=_get_candles("SENSEX",sx_strike,sx_expiry,"PE",interval,date_str)["close"]
+    n_ce =_get_candles("NIFTY", n_strike, n_expiry, "CE",interval,date_str)["close"]
+    n_pe =_get_candles("NIFTY", n_strike, n_expiry, "PE",interval,date_str)["close"]
+    sx_s=sx_strike+sx_ce-sx_pe; n_s=n_strike+n_ce-n_pe; mult=(sx_s/n_s).round(4)
+    return pd.DataFrame({"time":sx_s.index,"multiplier":mult.values,
+                         "sx_synth":sx_s.values.round(2),"n_synth":n_s.values.round(2)}).reset_index(drop=True)
