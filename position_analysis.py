@@ -308,17 +308,23 @@ def render():
 
     # ── Totals row with BEP ──────────────────────────────────────────────────
     try:
-        net_cf_total = df["Net Position CF"].sum() if "Net Position CF" in df.columns else 0
-        net_pos_total = df["Net Position"].sum() if "Net Position" in df.columns else 0
-        # Weighted average BEP
+        net_cf_total  = df["Net Position CF"].sum()  if "Net Position CF"  in df.columns else 0
+        net_pos_total = df["Net Position"].sum()      if "Net Position"     in df.columns else 0
+
         if "BEP" in df.columns and "Net Position" in df.columns:
             weights = df["Net Position"].abs()
             w_sum   = weights.sum()
             bep_total = (df["BEP"] * weights).sum() / w_sum if w_sum > 0 else 0
-            if net_cf_total < 0:
-                bep_total = -abs(bep_total)
         else:
             bep_total = 0
+
+        # Sign rule: follow Net Position; if 0, follow Net Position CF
+        ref_sign = net_pos_total if net_pos_total != 0 else net_cf_total
+        if ref_sign > 0:
+            bep_total = abs(bep_total)
+        elif ref_sign < 0:
+            bep_total = -abs(bep_total)
+
         qty_total   = abs(net_pos_total) if net_pos_total != 0 else 1
         bep_per_qty = round(bep_total / qty_total, 2) if qty_total else 0
     except Exception:
@@ -383,13 +389,15 @@ def render():
         elif n_checked == 0:
             st.info("Tick rows above to select positions.")
 
-        if st.button(
-            f"📊  Check {n_checked} position{'s' if n_checked!=1 else ''} in Spread Chart",
+        sb1, sb2 = st.columns(2)
+        with sb1:
+         if st.button(
+            f"📊  Check {n_checked} in Spread Chart",
             use_container_width=True,
             type="primary",
             disabled=btn_disabled,
             key="pos_send_to_spread"
-        ):
+         ):
             # Build legs from checked rows
             checked_rows = df[df["_row_id"].isin(_SS.pos_checked)]
             legs = []
@@ -422,6 +430,28 @@ def render():
                 # Navigate to spread chart
                 _SS.page = "spread"
                 st.success(f"✅ {n} legs loaded into Spread Chart!")
+                st.rerun()
+        with sb2:
+         if st.button(
+            f"🏗️  Send {n_checked} to Strategy Builder",
+            use_container_width=True,
+            type="secondary",
+            disabled=btn_disabled,
+            key="pos_send_to_sb"
+         ):
+            checked_rows2 = df[df["_row_id"].isin(_SS.pos_checked)]
+            sb_legs = []
+            for _, row2 in checked_rows2.head(10).iterrows():
+                try: sb_legs.append(_row_to_leg(row2))
+                except Exception: pass
+            if sb_legs:
+                for i2, leg2 in enumerate(sb_legs):
+                    _SS[f"sb_bs_{i2}"]     = leg2["bs"]
+                    _SS[f"sb_cp_{i2}"]     = leg2["cp"]
+                    _SS[f"sb_strike_{i2}"] = leg2["strike"]
+                    _SS[f"sb_prem_{i2}"]   = leg2["ltp"]
+                _SS.sb_n_legs = len(sb_legs)
+                _SS.page      = "strategy"
                 st.rerun()
 
     with sc3:
