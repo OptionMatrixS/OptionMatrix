@@ -6,7 +6,7 @@ import streamlit as st
 import sqlite3
 from auth import DB_PATH, init_db, _hash
 
-ALL_TOOLS   = ["spread","multiplier","iv","tracker","backtest","positions"]
+ALL_TOOLS   = ["spread","strategy","bhavcopy","multiplier","iv","tracker","backtest","positions"]
 TOOL_LABELS = {
     "spread":     "📊 Spread Chart",
     "multiplier": "✖️ Multiplier",
@@ -14,6 +14,8 @@ TOOL_LABELS = {
     "tracker":    "📋 Spread Tracker",
     "backtest":   "🕰️ Historical Backtest",
     "positions":  "📂 Position Analysis",
+    "strategy":   "🏗️ Strategy Builder",
+    "bhavcopy":   "📋 Live Bhavcopy",
 }
 SUB_OPTIONS = ["free","basic_5","basic_10","premium"]
 
