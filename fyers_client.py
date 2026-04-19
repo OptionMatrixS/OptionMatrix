@@ -1,6 +1,23 @@
 """
 fyers_client.py — Option Matrix
-Fyers auth copied EXACTLY from friend's working _get_access_token() in Doc 36.
+Auth copied EXACTLY from friend's working _get_access_token (Doc 20).
+  - redirect_uri = http://127.0.0.1:8080/
+  - fy_id and pin both b64 encoded
+  - appIdHash = SHA256(app_id:secret_key)  ← short app_id, not full client_id
+  - validate-authcode endpoint for Step 5
+
+IMPORTANT: In your Fyers API dashboard (myapi.fyers.in → Apps → Edit),
+set Redirect URL to exactly:  http://127.0.0.1:8080/
+
+Streamlit Cloud → Settings → Secrets:
+  FYERS_CLIENT_ID  = "YOURAPP-100"
+  FYERS_SECRET_KEY = "YOURSECRET"
+  FYERS_USERNAME   = "YOURID"
+  FYERS_PIN        = "1234"
+  FYERS_TOTP_KEY   = "YOURBASE32SECRET"
+
+Optional bypass (skips all TOTP):
+  FYERS_ACCESS_TOKEN = "eyJ..."
 """
 
 import os, base64, hashlib, math
@@ -13,8 +30,7 @@ from collections import defaultdict
 from urllib.parse import parse_qs, urlparse
 from fyers_apiv3 import fyersModel
 
-REDIRECT_URI   = "http://127.0.0.1:8080/"
-TOKEN_FILE     = "fyers_token.txt"
+REDIRECT_URI   = "http://127.0.0.1:8080/"   # ← must match Fyers dashboard exactly
 RISK_FREE_RATE = 0.065
 _MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 _UNDERLYING_SYM = {
@@ -26,7 +42,9 @@ _UNDERLYING_SYM = {
     "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
 }
 
-# ─── Secrets ──────────────────────────────────────────────────────────────────
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
 def _s(key: str) -> str:
     try:
         if key in st.secrets:
@@ -38,111 +56,150 @@ def _s(key: str) -> str:
 def _b64(v) -> str:
     return base64.b64encode(str(v).encode()).decode()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTH — copied EXACTLY from friend's _get_access_token (Doc 36)
-# ─────────────────────────────────────────────────────────────────────────────
 
-@st.cache_resource(ttl=3600)
+# ── auth — friend's exact technique from Doc 20 ───────────────────────────────
+
+@st.cache_resource(ttl=82800)   # ~23h — token valid until Fyers midnight reset
 def _get_access_token(client_id: str, secret_key: str,
                       username: str, pin: str, totp_key: str) -> str:
     """
-    Friend's exact working code from Doc 36.
-    ttl=3600 — refreshes every hour automatically.
-    Raises RuntimeError on failure (so Streamlit does NOT cache the error).
+    Fyers v3 TOTP auto-login.
+    Copied from friend's working _get_access_token (Doc 20):
+      Step 1: send_login_otp_v2  (fy_id = b64)
+      Step 2: verify_otp         (TOTP)
+      Step 3: verify_pin_v2      (pin = b64)
+      Step 4: token endpoint     (get auth_code)
+      Step 5: validate-authcode  (appIdHash = SHA256(app_id:secret_key))
+    Raises RuntimeError on failure → NOT cached by st.cache_resource.
     """
     s = _req.Session()
 
-    # Step 1: send_login_otp_v2 — b64 encoded fy_id
-    r1 = s.post("https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
-                json={"fy_id": _b64(username), "app_id": "2"}, timeout=10)
+    # Step 1 — send OTP
+    r1 = s.post(
+        "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
+        json={"fy_id": _b64(username), "app_id": "2"}, timeout=15)
     if r1.status_code == 429:
-        raise RuntimeError("Rate limited by Fyers (429). Wait ~60s and click Refresh Token.")
+        raise RuntimeError("Rate-limited by Fyers (429). Wait ~60s then click Refresh Token.")
+    if not r1.text.strip():
+        raise RuntimeError(f"Step1: empty response (HTTP {r1.status_code})")
     r1d = r1.json()
     if r1d.get("s") != "ok":
-        raise RuntimeError(f"Step 1 failed: {r1d}")
+        raise RuntimeError(f"Step1 failed: {r1d}")
 
-    # Step 2: verify_otp — TOTP code
-    totp = pyotp.TOTP(totp_key).now()
-    r2 = s.post("https://api-t2.fyers.in/vagator/v2/verify_otp",
-                json={"request_key": r1d["request_key"], "otp": totp}, timeout=10)
+    # Step 2 — verify TOTP
+    r2 = s.post(
+        "https://api-t2.fyers.in/vagator/v2/verify_otp",
+        json={"request_key": r1d["request_key"],
+              "otp": pyotp.TOTP(totp_key).now()}, timeout=15)
+    if not r2.text.strip():
+        raise RuntimeError(f"Step2: empty response (HTTP {r2.status_code})")
     r2d = r2.json()
     if r2d.get("s") != "ok":
         raise RuntimeError(
-            f"Step 2 failed: {r2d}\n"
-            "FYERS_TOTP_KEY must be the long Base32 secret (e.g. JBSWY3DPEHPK3PXP), "
-            "NOT the 6-digit code."
-        )
+            f"Step2 TOTP failed: {r2d}\n"
+            "FYERS_TOTP_KEY must be the Base32 secret (e.g. JBSWY3DPEHPK3PXP), "
+            "NOT the 6-digit code shown in your authenticator app.")
 
-    # Step 3: verify_pin_v2 — b64 encoded pin (EXACTLY as friend's code)
-    r3 = s.post("https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
-                json={"request_key": r2d["request_key"],
-                      "identity_type": "pin",
-                      "identifier": _b64(pin)},   # b64 — same as friend
-                timeout=10)
+    # Step 3 — verify PIN (b64 encoded — same as friend)
+    r3 = s.post(
+        "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
+        json={"request_key": r2d["request_key"],
+              "identity_type": "pin",
+              "identifier": _b64(pin)}, timeout=15)
+    if not r3.text.strip():
+        raise RuntimeError(f"Step3: empty response (HTTP {r3.status_code})")
     r3d = r3.json()
     if r3d.get("s") != "ok":
-        raise RuntimeError(
-            f"Step 3 failed: {r3d}\n"
-            "Check FYERS_PIN is your 4-digit Fyers login PIN."
-        )
-    access_token_stage1 = r3d["data"]["access_token"]
+        raise RuntimeError(f"Step3 PIN failed: {r3d}. Check FYERS_PIN.")
+    bearer = r3d["data"]["access_token"]
 
-    # Step 4: get auth_code — friend checks s == "ok" (NOT status 308)
-    app_id = client_id.split("-")[0]
-    r4 = s.post("https://api-t1.fyers.in/api/v3/token", json={
-        "fyers_id": username, "app_id": app_id,
-        "redirect_uri": REDIRECT_URI, "appType": "100",
-        "code_challenge": "", "state": "sample",
-        "scope": "", "nonce": "", "response_type": "code", "create_cookie": True,
-    }, headers={"Authorization": f"Bearer {access_token_stage1}"}, timeout=10)
+    # Step 4 — get auth_code
+    app_id = client_id.split("-")[0]   # "PXPO05H940" from "PXPO05H940-100"
+    r4 = s.post(
+        "https://api-t1.fyers.in/api/v3/token",
+        json={
+            "fyers_id":       username,
+            "app_id":         app_id,
+            "redirect_uri":   REDIRECT_URI,
+            "appType":        "100",
+            "code_challenge": "",
+            "state":          "sample",
+            "scope":          "",
+            "nonce":          "",
+            "response_type":  "code",
+            "create_cookie":  True,
+        },
+        headers={"Authorization": f"Bearer {bearer}"},
+        timeout=15)
+    if not r4.text.strip():
+        raise RuntimeError(f"Step4: empty response (HTTP {r4.status_code})")
     r4d = r4.json()
     if r4d.get("s") != "ok":
         raise RuntimeError(
-            f"Step 4 failed: {r4d}\n"
-            f"→ 'redirectUrl mismatch': Redirect URL in myapi.fyers.in must be: {REDIRECT_URI}\n"
-            f"→ 'apptype mismatch': FYERS_CLIENT_ID must end in -100 e.g. ABCD1234-100"
-        )
+            f"Step4 failed: {r4d}\n"
+            f"'redirectUrl mismatch' → set Redirect URL in myapi.fyers.in to: {REDIRECT_URI}\n"
+            f"'apptype mismatch'     → FYERS_CLIENT_ID must end in -100")
 
-    # Extract auth_code — friend's exact multi-location extraction
-    data = r4d.get("data", {})
+    # Extract auth_code from multiple possible locations (friend's exact logic)
+    data      = r4d.get("data", {})
     auth_code = (
         data.get("auth")
-        or parse_qs(urlparse(r4d.get("Url", "")).query).get("auth_code", [None])[0]
+        or parse_qs(urlparse(r4d.get("Url",  "")).query).get("auth_code", [None])[0]
         or parse_qs(urlparse(data.get("url", "")).query).get("auth_code", [None])[0]
+        or parse_qs(urlparse(data.get("Url", "")).query).get("auth_code", [None])[0]
     )
     if not auth_code:
-        raise RuntimeError(f"Step 4: no auth_code in response: {r4d}")
+        raise RuntimeError(f"Step4: no auth_code in response: {r4d}")
 
-    # Step 5: validate-authcode with SHA-256 hash — friend's method
+    # Step 5 — validate-authcode
+    # Friend uses SHA256(app_id:secret_key) — short app_id, NOT full client_id
     app_id_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
-    r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
-        "grant_type": "authorization_code",
-        "appIdHash":  app_id_hash,
-        "code":       auth_code,
-    }, timeout=10)
+    r5 = s.post(
+        "https://api-t1.fyers.in/api/v3/validate-authcode",
+        json={
+            "grant_type": "authorization_code",
+            "appIdHash":  app_id_hash,
+            "code":       auth_code,
+        }, timeout=15)
+    if not r5.text.strip():
+        raise RuntimeError(f"Step5: empty response (HTTP {r5.status_code})")
     r5d   = r5.json()
     token = r5d.get("access_token")
+    if token:
+        return token
 
-    if not token:
-        # Fallback: SessionModel (friend also has this fallback)
-        try:
-            session = fyersModel.SessionModel(
-                client_id=client_id, secret_key=secret_key,
-                redirect_uri=REDIRECT_URI, response_type="code",
-                grant_type="authorization_code")
-            session.set_token(auth_code)
-            r5d2  = session.generate_token()
-            token = r5d2.get("access_token")
-        except Exception as e:
-            raise RuntimeError(f"Step 5 both methods failed: {r5d} / SDK: {e}")
-        if not token:
-            raise RuntimeError(f"Step 5 both methods failed: {r5d} / {r5d2}")
-
-    return token
+    # Fallback: SDK SessionModel (friend also has this)
+    try:
+        session = fyersModel.SessionModel(
+            client_id=client_id, secret_key=secret_key,
+            redirect_uri=REDIRECT_URI, response_type="code",
+            grant_type="authorization_code")
+        session.set_token(auth_code)
+        r5d2  = session.generate_token()
+        token = r5d2.get("access_token")
+        if token:
+            return token
+        raise RuntimeError(
+            f"Step5 both methods failed:\n"
+            f"  validate-authcode: {r5d}\n"
+            f"  SDK fallback:      {r5d2}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(
+            f"Step5 both methods failed:\n"
+            f"  validate-authcode: {r5d}\n"
+            f"  SDK exception:     {e}")
 
 
 def get_token() -> str:
-    """Read secrets in Streamlit context, call cached auth."""
+    """Read secrets and return valid access token."""
+    # Option 1: direct token in secrets (fastest, bypasses all TOTP)
+    direct = _s("FYERS_ACCESS_TOKEN")
+    if direct and len(direct) > 20:
+        return direct
+
+    # Option 2: TOTP auto-login
     cid  = _s("FYERS_CLIENT_ID")
     sec  = _s("FYERS_SECRET_KEY")
     user = _s("FYERS_USERNAME")
@@ -155,9 +212,9 @@ def get_token() -> str:
     }.items() if not v]
     if missing:
         raise RuntimeError(
-            f"Missing secrets: {', '.join(missing)}\n"
-            "Add in Streamlit Cloud → ⋮ → Settings → Secrets"
-        )
+            f"Missing Streamlit secrets: {', '.join(missing)}\n"
+            "Go to Streamlit Cloud → ⋮ → Settings → Secrets and add them.")
+
     return _get_access_token(cid, sec, user, pin, totp)
 
 
@@ -165,48 +222,44 @@ def get_fyers_client():
     if st.session_state.get("_fc"):
         return st.session_state._fc
     tok = get_token()
-    cid = _s("FYERS_CLIENT_ID")
-    fc  = fyersModel.FyersModel(client_id=cid, is_async=False, token=tok, log_path="")
+    fc  = fyersModel.FyersModel(
+        client_id=_s("FYERS_CLIENT_ID"),
+        is_async=False, token=tok, log_path="")
     st.session_state._fc = fc
     return fc
 
 
 def refresh_token():
     _get_access_token.clear()
-    st.session_state.pop("_fc", None)
     for k in list(st.session_state.keys()):
-        if k.startswith("expiries_") or k.startswith("strikes_"):
-            del st.session_state[k]
+        if k in ("_fc",) or k.startswith("expiries_") or k.startswith("strikes_"):
+            st.session_state.pop(k, None)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXPIRIES — copied from friend's _fetch_expiries_from_fyers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── expiries ───────────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def _fetch_expiry_map(token, cid, sym):
+def _fetch_expiry_map(token: str, cid: str, sym: str) -> dict:
     try:
         fyers = fyersModel.FyersModel(client_id=cid, token=token, log_path="")
-        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 1, "timestamp": ""})
+        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 5, "timestamp": ""})
         if not (resp and resp.get("s") == "ok"):
             return {}
-        raw = resp.get("data", {}).get("expiryData", [])
         parsed = []
-        for e in raw:
+        for e in resp.get("data", {}).get("expiryData", []):
             if not isinstance(e, dict): continue
             try:
                 dd, mm, yy4 = e["date"].split("-")
-                dd, mm, yy4 = int(dd), int(mm), int(yy4)
+                parsed.append((int(yy4)%100, int(mm), int(dd), _MONTHS[int(mm)-1]))
             except Exception:
                 continue
-            parsed.append((yy4 % 100, mm, dd, _MONTHS[mm-1]))
         by_month = defaultdict(list)
         for yy, mm, dd, mon in parsed:
-            by_month[(yy, mm)].append(dd)
+            by_month[(yy,mm)].append(dd)
         last_day = {k: max(v) for k, v in by_month.items()}
-        result = {}
+        result   = {}
         for yy, mm, dd, mon in parsed:
-            is_m  = (dd == last_day[(yy, mm)])
+            is_m  = (dd == last_day[(yy,mm)])
             code  = f"{yy:02d}{mon}" if is_m else f"{yy:02d}{mm:02d}{dd:02d}"
             label = f"{dd:02d} {mon} {yy:02d} ({'M' if is_m else 'W'})"
             result[label] = code
@@ -224,7 +277,9 @@ def get_expiries(index: str) -> list:
     sym  = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
     data = _fetch_expiry_map(tok, cid, sym)
     if not data:
-        raise ValueError(f"No expiries from Fyers for {index}. Token may be expired.")
+        raise ValueError(
+            f"No expiries from Fyers for {index}. "
+            "Token may be expired — click Refresh Token in the sidebar.")
     st.session_state[ck] = data
     return list(data.keys())
 
@@ -253,55 +308,48 @@ def _dte(label: str, index: str = "") -> float:
 _days_to_expiry = _dte
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STRIKES
-# ─────────────────────────────────────────────────────────────────────────────
+# ── strikes ────────────────────────────────────────────────────────────────────
 
 def get_strikes(index: str, expiry_label: str) -> list:
     code = _label_to_code(index, expiry_label)
     ck   = f"strikes_{index}_{code}"
     if st.session_state.get(ck): return st.session_state[ck]
     try:
-        fyers = get_fyers_client()
-        sym   = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
-        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 50, "timestamp": ""})
+        sym  = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
+        resp = get_fyers_client().optionchain(
+            data={"symbol": sym, "strikecount": 50, "timestamp": ""})
         if resp and resp.get("s") == "ok":
             strikes = sorted({int(float(o["strikePrice"]))
                               for o in resp.get("data",{}).get("optionsChain",[])
-                              if isinstance(o, dict)})
+                              if isinstance(o, dict) and "strikePrice" in o})
             if strikes:
                 st.session_state[ck] = strikes
                 return strikes
     except Exception:
         pass
-    atm  = {"NIFTY": 22800, "SENSEX": 82500, "BANKNIFTY": 48000}.get(index, 22800)
-    step = 50 if index == "NIFTY" else (100 if index == "BANKNIFTY" else 500)
-    return list(range(atm - 20*step, atm + 21*step, step))
+    atm  = {"NIFTY":22800,"SENSEX":82500,"BANKNIFTY":48000}.get(index,22800)
+    step = 50 if index=="NIFTY" else (100 if index=="BANKNIFTY" else 500)
+    return list(range(atm-20*step, atm+21*step, step))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SYMBOL BUILDER — friend's exact build_option_symbol logic
-# ─────────────────────────────────────────────────────────────────────────────
+# ── symbol builder ─────────────────────────────────────────────────────────────
 
 def build_symbol(index: str, expiry_label: str, cp: str, strike: int) -> str:
-    exch = "BSE" if index in ("SENSEX", "BANKEX") else "NSE"
+    exch = "BSE" if index in ("SENSEX","BANKEX") else "NSE"
     code = _label_to_code(index, expiry_label).strip().upper()
-    ot   = "CE" if cp.upper() in ("CE", "C") else "PE"
-    if any(c.isalpha() for c in code):         # monthly e.g. 26MAY
+    ot   = "CE" if cp.upper() in ("CE","C") else "PE"
+    if any(c.isalpha() for c in code):          # monthly e.g. 26MAY
         return f"{exch}:{index}{code}{ot}{strike}"
-    yy, mm, dd = code[:2], str(int(code[2:4])), code[4:6]  # weekly → remove leading zero
+    yy, mm, dd = code[:2], str(int(code[2:4])), code[4:6]
     return f"{exch}:{index}{yy}{mm}{dd}{ot}{strike}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CANDLES — same as friend's fetch_ohlc_live
-# ─────────────────────────────────────────────────────────────────────────────
+# ── candles ────────────────────────────────────────────────────────────────────
 
 def _fetch_candles(symbol: str, interval=1, date_str=None) -> pd.DataFrame:
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
-    fyers = get_fyers_client()
-    resp  = fyers.history(data={
+    resp = get_fyers_client().history(data={
         "symbol": symbol, "resolution": str(interval),
         "date_format": "1", "range_from": date_str,
         "range_to": date_str, "cont_flag": "1"})
@@ -322,57 +370,59 @@ def _get_candles(index, strike, expiry_label, cp, interval=1, date_str=None):
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LIVE QUOTE
-# ─────────────────────────────────────────────────────────────────────────────
+# ── live quote ─────────────────────────────────────────────────────────────────
 
 def _quote(symbol: str) -> dict:
-    fyers = get_fyers_client()
-    resp  = fyers.quotes(data={"symbols": symbol})
+    resp = get_fyers_client().quotes(data={"symbols": symbol})
     if resp.get("s") != "ok":
         raise ValueError(f"Quote failed for {symbol}: {resp}")
     v = resp["d"][0]["v"]; ltp = float(v.get("lp", 0))
-    return {"ltp": ltp, "bid": float(v.get("bid", ltp*.998)),
-            "ask": float(v.get("ask", ltp*1.002)),
+    return {"ltp": ltp,
+            "bid": float(v.get("bid",  ltp*0.998)),
+            "ask": float(v.get("ask",  ltp*1.002)),
             "prev_close": float(v.get("prev_close_price", 0)),
-            "high": float(v.get("high_price", ltp)), "low": float(v.get("low_price", ltp))}
+            "high": float(v.get("high_price", ltp)),
+            "low":  float(v.get("low_price",  ltp))}
 
-def get_live_quote(i, s, e, c):    _validate_leg(i,s,e,c); return _quote(build_symbol(i,e,c,s))
-def get_live_ltp(i, s, e, c):      return get_live_quote(i,s,e,c)["ltp"]
-def get_live_bid_ask_ltp(i,s,e,c): q=get_live_quote(i,s,e,c); return q["bid"],q["ask"],q["ltp"]
+def get_live_quote(i,s,e,c):
+    _validate_leg(i,s,e,c); return _quote(build_symbol(i,e,c,s))
+def get_live_ltp(i,s,e,c):
+    return get_live_quote(i,s,e,c)["ltp"]
+def get_live_bid_ask_ltp(i,s,e,c):
+    q=get_live_quote(i,s,e,c); return q["bid"],q["ask"],q["ltp"]
 def get_spot_price(index: str) -> float:
     try:    return _quote(_UNDERLYING_SYM.get(index, f"NSE:{index}-INDEX"))["ltp"]
     except: return {"NIFTY":22800,"SENSEX":82500,"BANKNIFTY":48000}.get(index,22800)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# VALIDATION
-# ─────────────────────────────────────────────────────────────────────────────
+# ── validation ─────────────────────────────────────────────────────────────────
 
 def _validate_leg(index, strike, expiry, cp):
     if not index:                 raise ValueError("Index not selected.")
     if not expiry:                raise ValueError(f"Expiry not selected for {index}.")
     if not strike or strike <= 0: raise ValueError(f"Invalid strike {strike}.")
-    if cp not in ("CE","PE"):     raise ValueError(f"cp must be CE or PE.")
+    if cp not in ("CE","PE"):     raise ValueError("cp must be CE or PE.")
 
 def validate_legs(legs):
     if not legs: raise ValueError("No legs.")
     for i, leg in enumerate(legs):
-        try: _validate_leg(leg.get("index",""),leg.get("strike",0),leg.get("expiry",""),leg.get("cp",""))
-        except ValueError as e: raise ValueError(f"Leg {i+1}: {e}")
+        try:
+            _validate_leg(leg.get("index",""), leg.get("strike",0),
+                          leg.get("expiry",""), leg.get("cp",""))
+        except ValueError as e:
+            raise ValueError(f"Leg {i+1}: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SPREAD OHLCV
-# ─────────────────────────────────────────────────────────────────────────────
+# ── spread OHLCV ───────────────────────────────────────────────────────────────
 
 def get_live_spread_ohlcv(legs, interval=1, date_str=None) -> pd.DataFrame:
     validate_legs(legs)
     spread = base = None
     for leg in legs:
-        df    = _get_candles(leg["index"],leg["strike"],leg["expiry"],leg["cp"],interval,date_str)
+        df    = _get_candles(leg["index"],leg["strike"],leg["expiry"],
+                             leg["cp"],interval,date_str)
         price = df["close"] * leg["ratio"]
-        price = price if leg["bs"] == "Buy" else -price
+        price = price if leg["bs"]=="Buy" else -price
         if spread is None: spread, base = price, df.index
         else: spread = spread.reindex(base).add(price.reindex(base), fill_value=0)
     out = pd.DataFrame({"close": spread.values}, index=base)
@@ -384,9 +434,7 @@ def get_live_spread_ohlcv(legs, interval=1, date_str=None) -> pd.DataFrame:
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BLACK-SCHOLES
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Black-Scholes ──────────────────────────────────────────────────────────────
 
 def _ncdf(x): return (1+math.erf(x/math.sqrt(2)))/2
 def _npdf(x): return math.exp(-.5*x*x)/math.sqrt(2*math.pi)
@@ -394,7 +442,8 @@ def _npdf(x): return math.exp(-.5*x*x)/math.sqrt(2*math.pi)
 def bs_price(S,K,T,r,sig,cp):
     if T<=0 or sig<=0: return max(0.,(S-K) if cp=="CE" else (K-S))
     d1=(math.log(S/K)+(r+.5*sig**2)*T)/(sig*math.sqrt(T)); d2=d1-sig*math.sqrt(T)
-    return S*_ncdf(d1)-K*math.exp(-r*T)*_ncdf(d2) if cp=="CE" else K*math.exp(-r*T)*_ncdf(-d2)-S*_ncdf(-d1)
+    return S*_ncdf(d1)-K*math.exp(-r*T)*_ncdf(d2) if cp=="CE" \
+        else K*math.exp(-r*T)*_ncdf(-d2)-S*_ncdf(-d1)
 
 def implied_volatility(mp,S,K,T,r,cp):
     if mp<=0 or S<=0 or K<=0 or T<=0: return 0.
@@ -406,15 +455,20 @@ def implied_volatility(mp,S,K,T,r,cp):
     return mid
 
 def bs_greeks(S,K,T,r,sig,cp):
-    if T<=0 or sig<=0: return {"delta":0,"gamma":0,"vega":0,"theta":0,"iv":sig*100}
+    if T<=0 or sig<=0:
+        return {"delta":0,"gamma":0,"vega":0,"theta":0,"iv":sig*100}
     d1=(math.log(S/K)+(r+.5*sig**2)*T)/(sig*math.sqrt(T)); d2=d1-sig*math.sqrt(T)
     pdf=_npdf(d1); g=pdf/(S*sig*math.sqrt(T)); v=S*pdf*math.sqrt(T)/100
-    d=_ncdf(d1) if cp=="CE" else _ncdf(d1)-1
-    t=(-(S*pdf*sig)/(2*math.sqrt(T))+(-r*K*math.exp(-r*T)*_ncdf(d2) if cp=="CE" else r*K*math.exp(-r*T)*_ncdf(-d2)))/365
-    return {"delta":round(d,4),"gamma":round(g,6),"vega":round(v,4),"theta":round(t,4),"iv":round(sig*100,2)}
+    d  =_ncdf(d1) if cp=="CE" else _ncdf(d1)-1
+    th =(-(S*pdf*sig)/(2*math.sqrt(T)) +
+         (-r*K*math.exp(-r*T)*_ncdf(d2) if cp=="CE"
+          else r*K*math.exp(-r*T)*_ncdf(-d2))) / 365
+    return {"delta":round(d,4),"gamma":round(g,6),
+            "vega":round(v,4),"theta":round(th,4),"iv":round(sig*100,2)}
 
-def get_spread_greeks(legs,spots):
-    validate_legs(legs); net={"delta":0.,"gamma":0.,"vega":0.,"theta":0.,"ivs":[]}
+def get_spread_greeks(legs, spots):
+    validate_legs(legs)
+    net={"delta":0.,"gamma":0.,"vega":0.,"theta":0.,"ivs":[]}
     for leg in legs:
         try:
             S=float(spots.get(leg["index"],22800)); K=float(leg["strike"])
@@ -431,23 +485,27 @@ def get_spread_greeks(legs,spots):
             "net_iv":round(sum(net["ivs"])/len(net["ivs"]),2) if net["ivs"] else 0.}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IV SERIES / MULTIPLIER
-# ─────────────────────────────────────────────────────────────────────────────
+# ── IV series ──────────────────────────────────────────────────────────────────
 
 def get_iv_series_live(index,strike,expiry_label,cp,tf_minutes=5,date_str=None):
     _validate_leg(index,strike,expiry_label,cp)
     df=_get_candles(index,strike,expiry_label,cp,tf_minutes,date_str)
     spot=get_spot_price(index); T=_dte(expiry_label,index); rows=[]
     for ts,row in df.iterrows():
-        try: iv=implied_volatility(row["close"],spot,strike,T,RISK_FREE_RATE,cp)
+        try:    iv=implied_volatility(row["close"],spot,strike,T,RISK_FREE_RATE,cp)
         except: iv=0.
         rows.append({"time":ts,"iv_pct":round(iv*100,2)})
     return pd.DataFrame(rows)
 
-def get_multiplier_series_live(sx_strike,sx_expiry,n_strike,n_expiry,interval=1,date_str=None):
-    for i,s,e,c in [("SENSEX",sx_strike,sx_expiry,"CE"),("SENSEX",sx_strike,sx_expiry,"PE"),
-                    ("NIFTY",n_strike,n_expiry,"CE"),("NIFTY",n_strike,n_expiry,"PE")]:
+
+# ── multiplier series ──────────────────────────────────────────────────────────
+
+def get_multiplier_series_live(sx_strike,sx_expiry,n_strike,n_expiry,
+                                interval=1,date_str=None):
+    for i,s,e,c in [("SENSEX",sx_strike,sx_expiry,"CE"),
+                    ("SENSEX",sx_strike,sx_expiry,"PE"),
+                    ("NIFTY", n_strike, n_expiry, "CE"),
+                    ("NIFTY", n_strike, n_expiry, "PE")]:
         _validate_leg(i,s,e,c)
     sx_ce=_get_candles("SENSEX",sx_strike,sx_expiry,"CE",interval,date_str)["close"]
     sx_pe=_get_candles("SENSEX",sx_strike,sx_expiry,"PE",interval,date_str)["close"]
@@ -455,4 +513,5 @@ def get_multiplier_series_live(sx_strike,sx_expiry,n_strike,n_expiry,interval=1,
     n_pe =_get_candles("NIFTY", n_strike, n_expiry, "PE",interval,date_str)["close"]
     sx_s=sx_strike+sx_ce-sx_pe; n_s=n_strike+n_ce-n_pe; mult=(sx_s/n_s).round(4)
     return pd.DataFrame({"time":sx_s.index,"multiplier":mult.values,
-                         "sx_synth":sx_s.values.round(2),"n_synth":n_s.values.round(2)}).reset_index(drop=True)
+                         "sx_synth":sx_s.values.round(2),
+                         "n_synth":n_s.values.round(2)}).reset_index(drop=True)
