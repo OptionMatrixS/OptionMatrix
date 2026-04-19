@@ -1,23 +1,6 @@
 """
 fyers_client.py — Option Matrix
-Auth copied EXACTLY from friend's working _get_access_token (Doc 20).
-  - redirect_uri = http://127.0.0.1:8080/
-  - fy_id and pin both b64 encoded
-  - appIdHash = SHA256(app_id:secret_key)  ← short app_id, not full client_id
-  - validate-authcode endpoint for Step 5
-
-IMPORTANT: In your Fyers API dashboard (myapi.fyers.in → Apps → Edit),
-set Redirect URL to exactly:  http://127.0.0.1:8080/
-
-Streamlit Cloud → Settings → Secrets:
-  FYERS_CLIENT_ID  = "YOURAPP-100"
-  FYERS_SECRET_KEY = "YOURSECRET"
-  FYERS_USERNAME   = "YOURID"
-  FYERS_PIN        = "1234"
-  FYERS_TOTP_KEY   = "YOURBASE32SECRET"
-
-Optional bypass (skips all TOTP):
-  FYERS_ACCESS_TOKEN = "eyJ..."
+Friend's exact technique (Doc 20) + debug sidebar to diagnose -437.
 """
 
 import os, base64, hashlib, math
@@ -30,7 +13,7 @@ from collections import defaultdict
 from urllib.parse import parse_qs, urlparse
 from fyers_apiv3 import fyersModel
 
-REDIRECT_URI   = "http://127.0.0.1:8080/"   # ← must match Fyers dashboard exactly
+REDIRECT_URI   = "http://127.0.0.1:8080/"
 RISK_FREE_RATE = 0.065
 _MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 _UNDERLYING_SYM = {
@@ -41,9 +24,6 @@ _UNDERLYING_SYM = {
     "FINNIFTY":   "NSE:FINNIFTY-INDEX",
     "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
 }
-
-
-# ── helpers ────────────────────────────────────────────────────────────────────
 
 def _s(key: str) -> str:
     try:
@@ -57,118 +37,112 @@ def _b64(v) -> str:
     return base64.b64encode(str(v).encode()).decode()
 
 
-# ── auth — friend's exact technique from Doc 20 ───────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH
+# ─────────────────────────────────────────────────────────────────────────────
 
-@st.cache_resource(ttl=82800)   # ~23h — token valid until Fyers midnight reset
+@st.cache_resource(ttl=82800)
 def _get_access_token(client_id: str, secret_key: str,
                       username: str, pin: str, totp_key: str) -> str:
-    """
-    Fyers v3 TOTP auto-login.
-    Copied from friend's working _get_access_token (Doc 20):
-      Step 1: send_login_otp_v2  (fy_id = b64)
-      Step 2: verify_otp         (TOTP)
-      Step 3: verify_pin_v2      (pin = b64)
-      Step 4: token endpoint     (get auth_code)
-      Step 5: validate-authcode  (appIdHash = SHA256(app_id:secret_key))
-    Raises RuntimeError on failure → NOT cached by st.cache_resource.
-    """
-    s = _req.Session()
 
-    # Step 1 — send OTP
-    r1 = s.post(
-        "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
-        json={"fy_id": _b64(username), "app_id": "2"}, timeout=15)
+    s = _req.Session()
+    s.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
+
+    # Step 1
+    r1 = s.post("https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
+                json={"fy_id": _b64(username), "app_id": "2"}, timeout=15)
     if r1.status_code == 429:
-        raise RuntimeError("Rate-limited by Fyers (429). Wait ~60s then click Refresh Token.")
+        raise RuntimeError("Rate-limited (429). Wait ~60s then click Refresh Token.")
     if not r1.text.strip():
-        raise RuntimeError(f"Step1: empty response (HTTP {r1.status_code})")
+        raise RuntimeError(f"Step1: empty response HTTP {r1.status_code}")
     r1d = r1.json()
     if r1d.get("s") != "ok":
         raise RuntimeError(f"Step1 failed: {r1d}")
 
-    # Step 2 — verify TOTP
-    r2 = s.post(
-        "https://api-t2.fyers.in/vagator/v2/verify_otp",
-        json={"request_key": r1d["request_key"],
-              "otp": pyotp.TOTP(totp_key).now()}, timeout=15)
+    # Step 2
+    r2 = s.post("https://api-t2.fyers.in/vagator/v2/verify_otp",
+                json={"request_key": r1d["request_key"],
+                      "otp": pyotp.TOTP(totp_key).now()}, timeout=15)
     if not r2.text.strip():
-        raise RuntimeError(f"Step2: empty response (HTTP {r2.status_code})")
+        raise RuntimeError(f"Step2: empty response HTTP {r2.status_code}")
     r2d = r2.json()
     if r2d.get("s") != "ok":
         raise RuntimeError(
             f"Step2 TOTP failed: {r2d}\n"
-            "FYERS_TOTP_KEY must be the Base32 secret (e.g. JBSWY3DPEHPK3PXP), "
-            "NOT the 6-digit code shown in your authenticator app.")
+            "FYERS_TOTP_KEY must be Base32 secret, NOT the 6-digit code.")
 
-    # Step 3 — verify PIN (b64 encoded — same as friend)
-    r3 = s.post(
-        "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
-        json={"request_key": r2d["request_key"],
-              "identity_type": "pin",
-              "identifier": _b64(pin)}, timeout=15)
+    # Step 3
+    r3 = s.post("https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
+                json={"request_key": r2d["request_key"],
+                      "identity_type": "pin", "identifier": _b64(pin)}, timeout=15)
     if not r3.text.strip():
-        raise RuntimeError(f"Step3: empty response (HTTP {r3.status_code})")
+        raise RuntimeError(f"Step3: empty response HTTP {r3.status_code}")
     r3d = r3.json()
     if r3d.get("s") != "ok":
-        raise RuntimeError(f"Step3 PIN failed: {r3d}. Check FYERS_PIN.")
+        raise RuntimeError(f"Step3 PIN failed: {r3d}")
     bearer = r3d["data"]["access_token"]
 
     # Step 4 — get auth_code
-    app_id = client_id.split("-")[0]   # "PXPO05H940" from "PXPO05H940-100"
-    r4 = s.post(
-        "https://api-t1.fyers.in/api/v3/token",
-        json={
-            "fyers_id":       username,
-            "app_id":         app_id,
-            "redirect_uri":   REDIRECT_URI,
-            "appType":        "100",
-            "code_challenge": "",
-            "state":          "sample",
-            "scope":          "",
-            "nonce":          "",
-            "response_type":  "code",
-            "create_cookie":  True,
-        },
-        headers={"Authorization": f"Bearer {bearer}"},
-        timeout=15)
+    app_id = client_id.split("-")[0]
+    r4 = s.post("https://api-t1.fyers.in/api/v3/token", json={
+        "fyers_id": username, "app_id": app_id,
+        "redirect_uri": REDIRECT_URI, "appType": "100",
+        "code_challenge": "", "state": "sample",
+        "scope": "", "nonce": "", "response_type": "code", "create_cookie": True,
+    }, headers={"Authorization": f"Bearer {bearer}"}, timeout=15)
     if not r4.text.strip():
-        raise RuntimeError(f"Step4: empty response (HTTP {r4.status_code})")
+        raise RuntimeError(f"Step4: empty response HTTP {r4.status_code}")
     r4d = r4.json()
+
+    # ── Store full Step4 response in session for debug display ────────────────
+    try:
+        st.session_state["_debug_step4"] = str(r4d)
+    except Exception:
+        pass
+
     if r4d.get("s") != "ok":
         raise RuntimeError(
             f"Step4 failed: {r4d}\n"
-            f"'redirectUrl mismatch' → set Redirect URL in myapi.fyers.in to: {REDIRECT_URI}\n"
-            f"'apptype mismatch'     → FYERS_CLIENT_ID must end in -100")
+            f"→ redirectUrl mismatch: set Fyers dashboard Redirect URL to: {REDIRECT_URI}\n"
+            f"→ apptype mismatch: FYERS_CLIENT_ID must end in -100")
 
-    # Extract auth_code from multiple possible locations (friend's exact logic)
+    # Extract auth_code — check every possible location
     data      = r4d.get("data", {})
     auth_code = (
-        data.get("auth")
-        or parse_qs(urlparse(r4d.get("Url",  "")).query).get("auth_code", [None])[0]
-        or parse_qs(urlparse(data.get("url", "")).query).get("auth_code", [None])[0]
-        or parse_qs(urlparse(data.get("Url", "")).query).get("auth_code", [None])[0]
+        data.get("auth_code")                                                          # location A
+        or data.get("auth")                                                            # location B
+        or parse_qs(urlparse(r4d.get("Url",  "")).query).get("auth_code", [None])[0]  # location C
+        or parse_qs(urlparse(r4d.get("url",  "")).query).get("auth_code", [None])[0]  # location D
+        or parse_qs(urlparse(data.get("Url", "")).query).get("auth_code", [None])[0]  # location E
+        or parse_qs(urlparse(data.get("url", "")).query).get("auth_code", [None])[0]  # location F
     )
-    if not auth_code:
-        raise RuntimeError(f"Step4: no auth_code in response: {r4d}")
 
-    # Step 5 — validate-authcode
-    # Friend uses SHA256(app_id:secret_key) — short app_id, NOT full client_id
+    try:
+        st.session_state["_debug_auth_code"] = auth_code or "NOT FOUND"
+    except Exception:
+        pass
+
+    if not auth_code:
+        raise RuntimeError(
+            f"Step4: no auth_code found anywhere in response.\n"
+            f"Full response: {r4d}\n"
+            f"Check Redirect URL in Fyers dashboard = {REDIRECT_URI}")
+
+    # Step 5 — validate-authcode  (app_id:secret_key — short form, per friend)
     app_id_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
-    r5 = s.post(
-        "https://api-t1.fyers.in/api/v3/validate-authcode",
-        json={
-            "grant_type": "authorization_code",
-            "appIdHash":  app_id_hash,
-            "code":       auth_code,
-        }, timeout=15)
+    r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
+        "grant_type": "authorization_code",
+        "appIdHash":  app_id_hash,
+        "code":       auth_code,
+    }, timeout=15)
     if not r5.text.strip():
-        raise RuntimeError(f"Step5: empty response (HTTP {r5.status_code})")
+        raise RuntimeError(f"Step5: empty response HTTP {r5.status_code}")
     r5d   = r5.json()
     token = r5d.get("access_token")
     if token:
         return token
 
-    # Fallback: SDK SessionModel (friend also has this)
+    # Fallback: SDK SessionModel
     try:
         session = fyersModel.SessionModel(
             client_id=client_id, secret_key=secret_key,
@@ -181,25 +155,24 @@ def _get_access_token(client_id: str, secret_key: str,
             return token
         raise RuntimeError(
             f"Step5 both methods failed:\n"
-            f"  validate-authcode: {r5d}\n"
-            f"  SDK fallback:      {r5d2}")
+            f"  validate-authcode → {r5d}\n"
+            f"  SDK fallback      → {r5d2}\n\n"
+            f"DEBUG — Step4 full response:\n{r4d}\n\n"
+            f"auth_code extracted: {auth_code}")
     except RuntimeError:
         raise
     except Exception as e:
         raise RuntimeError(
             f"Step5 both methods failed:\n"
-            f"  validate-authcode: {r5d}\n"
-            f"  SDK exception:     {e}")
+            f"  validate-authcode → {r5d}\n"
+            f"  SDK exception     → {e}")
 
 
 def get_token() -> str:
-    """Read secrets and return valid access token."""
-    # Option 1: direct token in secrets (fastest, bypasses all TOTP)
     direct = _s("FYERS_ACCESS_TOKEN")
     if direct and len(direct) > 20:
         return direct
 
-    # Option 2: TOTP auto-login
     cid  = _s("FYERS_CLIENT_ID")
     sec  = _s("FYERS_SECRET_KEY")
     user = _s("FYERS_USERNAME")
@@ -232,11 +205,37 @@ def get_fyers_client():
 def refresh_token():
     _get_access_token.clear()
     for k in list(st.session_state.keys()):
-        if k in ("_fc",) or k.startswith("expiries_") or k.startswith("strikes_"):
+        if k in ("_fc","_debug_step4","_debug_auth_code") \
+           or k.startswith("expiries_") or k.startswith("strikes_"):
             st.session_state.pop(k, None)
 
 
-# ── expiries ───────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG PANEL — call this from app.py sidebar to diagnose login issues
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_debug_panel():
+    """
+    Add this to app.py sidebar (admin only) to diagnose Step4/Step5 failures:
+
+        from fyers_client import render_debug_panel
+        if st.session_state.role == "admin":
+            render_debug_panel()
+    """
+    with st.expander("🔧 Fyers Auth Debug", expanded=False):
+        step4 = st.session_state.get("_debug_step4", "No login attempt yet")
+        code  = st.session_state.get("_debug_auth_code", "—")
+        st.markdown("**Step 4 full response:**")
+        st.code(step4, language="json")
+        st.markdown(f"**auth_code extracted:** `{code}`")
+        st.caption(
+            "If auth_code shows 'NOT FOUND', copy the Step4 response above "
+            "and share it — it will show exactly where Fyers puts the code.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPIRIES
+# ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def _fetch_expiry_map(token: str, cid: str, sym: str) -> dict:
@@ -279,7 +278,7 @@ def get_expiries(index: str) -> list:
     if not data:
         raise ValueError(
             f"No expiries from Fyers for {index}. "
-            "Token may be expired — click Refresh Token in the sidebar.")
+            "Token may be expired — click Refresh Token in sidebar.")
     st.session_state[ck] = data
     return list(data.keys())
 
@@ -308,7 +307,9 @@ def _dte(label: str, index: str = "") -> float:
 _days_to_expiry = _dte
 
 
-# ── strikes ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STRIKES
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_strikes(index: str, expiry_label: str) -> list:
     code = _label_to_code(index, expiry_label)
@@ -332,19 +333,23 @@ def get_strikes(index: str, expiry_label: str) -> list:
     return list(range(atm-20*step, atm+21*step, step))
 
 
-# ── symbol builder ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SYMBOL BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_symbol(index: str, expiry_label: str, cp: str, strike: int) -> str:
     exch = "BSE" if index in ("SENSEX","BANKEX") else "NSE"
     code = _label_to_code(index, expiry_label).strip().upper()
     ot   = "CE" if cp.upper() in ("CE","C") else "PE"
-    if any(c.isalpha() for c in code):          # monthly e.g. 26MAY
+    if any(c.isalpha() for c in code):
         return f"{exch}:{index}{code}{ot}{strike}"
     yy, mm, dd = code[:2], str(int(code[2:4])), code[4:6]
     return f"{exch}:{index}{yy}{mm}{dd}{ot}{strike}"
 
 
-# ── candles ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CANDLES
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_candles(symbol: str, interval=1, date_str=None) -> pd.DataFrame:
     if date_str is None:
@@ -370,32 +375,32 @@ def _get_candles(index, strike, expiry_label, cp, interval=1, date_str=None):
     return df
 
 
-# ── live quote ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# LIVE QUOTE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _quote(symbol: str) -> dict:
     resp = get_fyers_client().quotes(data={"symbols": symbol})
     if resp.get("s") != "ok":
         raise ValueError(f"Quote failed for {symbol}: {resp}")
     v = resp["d"][0]["v"]; ltp = float(v.get("lp", 0))
-    return {"ltp": ltp,
-            "bid": float(v.get("bid",  ltp*0.998)),
-            "ask": float(v.get("ask",  ltp*1.002)),
+    return {"ltp": ltp, "bid": float(v.get("bid", ltp*0.998)),
+            "ask": float(v.get("ask", ltp*1.002)),
             "prev_close": float(v.get("prev_close_price", 0)),
             "high": float(v.get("high_price", ltp)),
             "low":  float(v.get("low_price",  ltp))}
 
-def get_live_quote(i,s,e,c):
-    _validate_leg(i,s,e,c); return _quote(build_symbol(i,e,c,s))
-def get_live_ltp(i,s,e,c):
-    return get_live_quote(i,s,e,c)["ltp"]
-def get_live_bid_ask_ltp(i,s,e,c):
-    q=get_live_quote(i,s,e,c); return q["bid"],q["ask"],q["ltp"]
+def get_live_quote(i,s,e,c):    _validate_leg(i,s,e,c); return _quote(build_symbol(i,e,c,s))
+def get_live_ltp(i,s,e,c):      return get_live_quote(i,s,e,c)["ltp"]
+def get_live_bid_ask_ltp(i,s,e,c): q=get_live_quote(i,s,e,c); return q["bid"],q["ask"],q["ltp"]
 def get_spot_price(index: str) -> float:
     try:    return _quote(_UNDERLYING_SYM.get(index, f"NSE:{index}-INDEX"))["ltp"]
     except: return {"NIFTY":22800,"SENSEX":82500,"BANKNIFTY":48000}.get(index,22800)
 
 
-# ── validation ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATION
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _validate_leg(index, strike, expiry, cp):
     if not index:                 raise ValueError("Index not selected.")
@@ -413,7 +418,9 @@ def validate_legs(legs):
             raise ValueError(f"Leg {i+1}: {e}")
 
 
-# ── spread OHLCV ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SPREAD OHLCV
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_live_spread_ohlcv(legs, interval=1, date_str=None) -> pd.DataFrame:
     validate_legs(legs)
@@ -434,7 +441,9 @@ def get_live_spread_ohlcv(legs, interval=1, date_str=None) -> pd.DataFrame:
     return out
 
 
-# ── Black-Scholes ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# BLACK-SCHOLES
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _ncdf(x): return (1+math.erf(x/math.sqrt(2)))/2
 def _npdf(x): return math.exp(-.5*x*x)/math.sqrt(2*math.pi)
@@ -485,7 +494,9 @@ def get_spread_greeks(legs, spots):
             "net_iv":round(sum(net["ivs"])/len(net["ivs"]),2) if net["ivs"] else 0.}
 
 
-# ── IV series ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# IV SERIES / MULTIPLIER
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_iv_series_live(index,strike,expiry_label,cp,tf_minutes=5,date_str=None):
     _validate_leg(index,strike,expiry_label,cp)
@@ -496,9 +507,6 @@ def get_iv_series_live(index,strike,expiry_label,cp,tf_minutes=5,date_str=None):
         except: iv=0.
         rows.append({"time":ts,"iv_pct":round(iv*100,2)})
     return pd.DataFrame(rows)
-
-
-# ── multiplier series ──────────────────────────────────────────────────────────
 
 def get_multiplier_series_live(sx_strike,sx_expiry,n_strike,n_expiry,
                                 interval=1,date_str=None):
