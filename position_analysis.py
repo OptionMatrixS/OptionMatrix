@@ -12,110 +12,132 @@ DISPLAY_COLS = [
     "ID", "Underlying", "Expiry Date", "Strike Price",
     "Scrip Type", "Net Position CF", "Price CF",
     "MTM", "Net Position", "BEP", "LTP",
-    "IV", "Delta", "Vega", "Gamma", "Theta",
 ]
-NUMERIC_COLS = [
-    "Net Position CF", "Price CF", "MTM", "Net Position",
-    "IV", "Delta", "Vega", "Gamma", "Theta",
-]
-COL_RENAME = {
-    "ID": "ID", "Underlying": "Underlying", "Expiry Date": "Expiry",
-    "Strike Price": "Strike", "Scrip Type": "Type",
-    "Net Position CF": "Net Pos CF", "Price CF": "Price CF",
-    "MTM": "MTM", "Net Position": "Net Pos", "BEP": "BEP", "LTP": "LTP",
-    "IV": "IV %", "Delta": "Delta", "Vega": "Vega", "Gamma": "Gamma", "Theta": "Theta",
-}
 
-# ✅ FINAL FIXED FILE READER
+NUMERIC_COLS = [
+    "Net Position CF", "Price CF", "MTM", "Net Position"
+]
+
+# ─────────────────────────────────────────────
+# FILE READER (FINAL STABLE)
+# ─────────────────────────────────────────────
 def _read_file(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
     raw  = uploaded.read()
 
     if name.endswith(".csv"):
-
-        # Try multiple encodings first
         for enc in ("utf-8", "cp1252", "latin-1", "iso-8859-1", "utf-8-sig"):
             try:
                 return pd.read_csv(io.BytesIO(raw), encoding=enc)
-            except Exception:
+            except:
                 continue
 
-        # 🔥 FINAL SAFE PARSER (handles ALL bad CSVs)
         try:
-            return pd.read_csv(
-                io.BytesIO(raw),
-                encoding="latin-1",
-                on_bad_lines="skip",
-                engine="python"
-            )
+            return pd.read_csv(io.BytesIO(raw), encoding="latin-1",
+                               on_bad_lines="skip", engine="python")
         except TypeError:
-            # Older pandas fallback
-            return pd.read_csv(
-                io.BytesIO(raw),
-                encoding="latin-1",
-                engine="python"
-            )
+            return pd.read_csv(io.BytesIO(raw), encoding="latin-1",
+                               engine="python")
 
     elif name.endswith((".xlsx", ".xls")):
         return pd.read_excel(io.BytesIO(raw))
 
-    raise ValueError(f"Unsupported file type: {uploaded.name}")
+    raise ValueError("Unsupported file type")
 
-
+# ─────────────────────────────────────────────
 def _clean_numeric(df):
-    for col in NUMERIC_COLS:
+    for col in NUMERIC_COLS + ["BEP"]:
         if col in df.columns:
-            df[col] = (df[col].astype(str)
-                       .str.replace(",", "", regex=False)
-                       .str.replace(" ", "", regex=False))
+            df[col] = (
+                df[col].astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace(" ", "", regex=False)
+            )
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
+def _fmt(x):
+    if pd.isna(x): return "—"
+    return f"{x:+,.2f}"
 
-def _init():
-    for k, v in [
-        ("pos_df", None),
-        ("pos_checked", set()),
-    ]:
-        if k not in _SS:
-            _SS[k] = v
+def _color(x):
+    if pd.isna(x): return "#d1d4dc"
+    return "#26a69a" if x > 0 else "#ef5350" if x < 0 else "#d1d4dc"
 
-
+# ─────────────────────────────────────────────
 def render():
-    _init()
+    st.title("📊 Position Analysis")
 
-    st.markdown("## 📂 Position Data Analysis")
+    uploaded = st.file_uploader("Upload CSV / Excel", type=["csv","xlsx","xls"])
 
-    uploaded = st.file_uploader(
-        "Upload position file (.xlsx, .xls or .csv)",
-        type=["xlsx", "csv", "xls"],
-        key="pos_upload"
-    )
-
-    if uploaded is not None:
-        try:
-            df_raw = _read_file(uploaded)
-            df_raw = _clean_numeric(df_raw)
-            df_raw["_row_id"] = range(len(df_raw))
-
-            _SS.pos_df = df_raw
-            _SS.pos_checked = set()
-
-            st.success(f"✅ Loaded {len(df_raw)} rows × {len(df_raw.columns)} columns")
-
-        except Exception as e:
-            st.error(f"❌ Failed to load file: {e}")
-            return
-
-    elif _SS.pos_df is not None:
-        df_raw = _SS.pos_df
-        st.info("📋 Using previously uploaded file.")
-
-    else:
-        st.info("Upload a file to begin")
+    if uploaded is None:
+        st.info("Upload file to begin")
         return
 
-    df = _SS.pos_df
+    df = _read_file(uploaded)
+    df = _clean_numeric(df)
 
-    st.markdown("### Preview")
-    st.dataframe(df.head(50), use_container_width=True)
+    # ─────────────────────────────────────────
+    # FILTERS
+    # ─────────────────────────────────────────
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if "ID" in df.columns:
+            ids = df["ID"].dropna().unique().tolist()
+            sel_id = st.multiselect("ID", ids, default=ids[:1])
+            df = df[df["ID"].isin(sel_id)]
+
+    with col2:
+        if "Underlying" in df.columns:
+            und = df["Underlying"].dropna().unique().tolist()
+            sel_und = st.multiselect("Underlying", und, default=und)
+            df = df[df["Underlying"].isin(sel_und)]
+
+    with col3:
+        if "Strike Price" in df.columns:
+            strikes = sorted(df["Strike Price"].dropna().unique())
+            sel_strike = st.multiselect("Strike Price", strikes, default=strikes)
+            df = df[df["Strike Price"].isin(sel_strike)]
+
+    if df.empty:
+        st.warning("No data after filters")
+        return
+
+    # ─────────────────────────────────────────
+    # APPLY BEP SIGN LOGIC
+    # ─────────────────────────────────────────
+    def fix_bep(row):
+        bep = row.get("BEP", 0)
+        net_pos = row.get("Net Position", 0)
+        net_cf  = row.get("Net Position CF", 0)
+
+        if pd.isna(bep): return 0
+
+        if net_pos != 0:
+            return abs(bep) if net_pos > 0 else -abs(bep)
+        else:
+            return abs(bep) if net_cf > 0 else -abs(bep)
+
+    df["BEP"] = df.apply(fix_bep, axis=1)
+
+    # ─────────────────────────────────────────
+    # DISPLAY TABLE
+    # ─────────────────────────────────────────
+    st.subheader("📋 Data")
+
+    st.dataframe(df[DISPLAY_COLS], use_container_width=True)
+
+    # ─────────────────────────────────────────
+    # TOTALS
+    # ─────────────────────────────────────────
+    st.subheader("📊 Totals")
+
+    totals = {}
+    for col in DISPLAY_COLS:
+        if col in NUMERIC_COLS + ["BEP"]:
+            totals[col] = df[col].sum()
+        else:
+            totals[col] = "TOTAL"
+
+    st.dataframe(pd.DataFrame([totals]), use_container_width=True)
