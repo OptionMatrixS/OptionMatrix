@@ -229,7 +229,7 @@ def render_debug_panel():
 def _fetch_expiry_map(token: str, cid: str, sym: str) -> dict:
     try:
         fyers = fyersModel.FyersModel(client_id=cid, token=token, log_path="")
-        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 0, "timestamp": ""})
+        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 500, "timestamp": ""})
         if not (resp and resp.get("s") == "ok"):
             return {}
         parsed = []
@@ -294,25 +294,53 @@ _days_to_expiry = _dte
 
 
 def get_strikes(index: str, expiry_label: str) -> list:
+    """
+    Fetch ALL tradeable strikes for this index+expiry from Fyers.
+    Uses timestamp= expiry_date so Fyers returns strikes for that specific expiry.
+    strikecount=500 ensures we get the full chain (Fyers caps at available strikes).
+    Falls back to live-spot-based range if API fails.
+    """
     code = _label_to_code(index, expiry_label)
     ck   = f"strikes_{index}_{code}"
-    if st.session_state.get(ck): return st.session_state[ck]
+    if st.session_state.get(ck):
+        return st.session_state[ck]
     try:
         sym  = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
-        resp = get_fyers_client().optionchain(
-            data={"symbol": sym, "strikecount": 0, "timestamp": ""})
+        fyers = get_fyers_client()
+
+        # Pass the expiry date as timestamp so Fyers returns
+        # strikes specific to that expiry, not just ATM ± N
+        try:
+            exp_date = _code_to_date(code).strftime("%Y-%m-%d")
+        except Exception:
+            exp_date = ""
+
+        resp = fyers.optionchain(data={
+            "symbol":      sym,
+            "strikecount": 500,       # large enough to get full chain
+            "timestamp":   exp_date,  # filter by expiry date
+        })
         if resp and resp.get("s") == "ok":
-            strikes = sorted({int(float(o["strikePrice"]))
-                              for o in resp.get("data",{}).get("optionsChain",[])
-                              if isinstance(o, dict) and "strikePrice" in o})
+            chain = resp.get("data", {}).get("optionsChain", [])
+            strikes = sorted({
+                int(float(o["strikePrice"]))
+                for o in chain
+                if isinstance(o, dict) and "strikePrice" in o
+            })
             if strikes:
                 st.session_state[ck] = strikes
                 return strikes
     except Exception:
         pass
-    atm  = {"NIFTY":22800,"SENSEX":82500,"BANKNIFTY":48000}.get(index,22800)
-    step = 50 if index=="NIFTY" else (100 if index=="BANKNIFTY" else 500)
-    return list(range(atm-20*step, atm+21*step, step))
+
+    # Fallback: build range around live spot price ± 40 strikes
+    try:
+        spot = get_spot_price(index)
+    except Exception:
+        spot = {"NIFTY": 22800, "SENSEX": 82500, "BANKNIFTY": 48000}.get(index, 22800)
+    step = 50 if index == "NIFTY" else (100 if index == "BANKNIFTY" else 500)
+    atm  = int(round(spot / step) * step)
+    return list(range(atm - 60*step, atm + 61*step, step))
 
 
 def build_symbol(index: str, expiry_label: str, cp: str, strike: int) -> str:
