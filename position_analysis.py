@@ -26,23 +26,35 @@ COL_RENAME = {
     "IV": "IV %", "Delta": "Delta", "Vega": "Vega", "Gamma": "Gamma", "Theta": "Theta",
 }
 
-# ✅ FIXED FUNCTION
+# ✅ FINAL FIXED FILE READER
 def _read_file(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
     raw  = uploaded.read()
 
     if name.endswith(".csv"):
+
+        # Try multiple encodings first
         for enc in ("utf-8", "cp1252", "latin-1", "iso-8859-1", "utf-8-sig"):
             try:
                 return pd.read_csv(io.BytesIO(raw), encoding=enc)
             except Exception:
                 continue
 
-        # 🔥 FINAL SAFE FALLBACK
+        # 🔥 FINAL SAFE PARSER (handles ALL bad CSVs)
         try:
-            return pd.read_csv(io.BytesIO(raw), encoding="latin-1", on_bad_lines="skip")
+            return pd.read_csv(
+                io.BytesIO(raw),
+                encoding="latin-1",
+                on_bad_lines="skip",
+                engine="python"
+            )
         except TypeError:
-            return pd.read_csv(io.BytesIO(raw), encoding="latin-1")
+            # Older pandas fallback
+            return pd.read_csv(
+                io.BytesIO(raw),
+                encoding="latin-1",
+                engine="python"
+            )
 
     elif name.endswith((".xlsx", ".xls")):
         return pd.read_excel(io.BytesIO(raw))
