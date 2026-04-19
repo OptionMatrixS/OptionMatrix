@@ -210,6 +210,7 @@ def get_fyers_client():
 
 def refresh_token():
     _get_access_token.clear()
+    _fetch_expiry_map.clear()   # clear cached strikes/expiries too
     for k in list(st.session_state.keys()):
         if k in ("_fc","_debug_step4","_debug_auth_code") \
            or k.startswith("expiries_") or k.startswith("strikes_"):
@@ -228,7 +229,7 @@ def render_debug_panel():
 def _fetch_expiry_map(token: str, cid: str, sym: str) -> dict:
     try:
         fyers = fyersModel.FyersModel(client_id=cid, token=token, log_path="")
-        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 5, "timestamp": ""})
+        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 0, "timestamp": ""})
         if not (resp and resp.get("s") == "ok"):
             return {}
         parsed = []
@@ -299,7 +300,7 @@ def get_strikes(index: str, expiry_label: str) -> list:
     try:
         sym  = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
         resp = get_fyers_client().optionchain(
-            data={"symbol": sym, "strikecount": 50, "timestamp": ""})
+            data={"symbol": sym, "strikecount": 0, "timestamp": ""})
         if resp and resp.get("s") == "ok":
             strikes = sorted({int(float(o["strikePrice"]))
                               for o in resp.get("data",{}).get("optionsChain",[])
