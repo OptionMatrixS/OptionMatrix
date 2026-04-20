@@ -344,13 +344,36 @@ def get_strikes(index: str, expiry_label: str) -> list:
 
 
 def build_symbol(index: str, expiry_label: str, cp: str, strike: int) -> str:
+    """
+    Build Fyers option symbol.
+
+    NSE weekly format: NSE:NIFTY25423CE24500   (YY + M_no_leading_zero + DD)
+    BSE weekly format: BSE:SENSEX250423CE78500  (YY + MM_zero_padded + DD)
+    Monthly format:    BSE:SENSEX25APRICE78500  / NSE:NIFTY25APRCE24500
+
+    NSE drops leading zero on month: April=4 → "4"
+    BSE keeps leading zero on month: April=4 → "04"
+    """
     exch = "BSE" if index in ("SENSEX","BANKEX") else "NSE"
     code = _label_to_code(index, expiry_label).strip().upper()
     ot   = "CE" if cp.upper() in ("CE","C") else "PE"
+
     if any(c.isalpha() for c in code):
+        # Monthly: both NSE and BSE use same format e.g. 25APR
         return f"{exch}:{index}{code}{ot}{strike}"
-    yy, mm, dd = code[:2], str(int(code[2:4])), code[4:6]
-    return f"{exch}:{index}{yy}{mm}{dd}{ot}{strike}"
+
+    # Weekly: YYMMDD (6 digits)
+    yy = code[0:2]   # e.g. "25"
+    mm = code[2:4]   # e.g. "04"
+    dd = code[4:6]   # e.g. "23"
+
+    if exch == "BSE":
+        # BSE keeps zero-padded month: BSE:SENSEX250423CE78500
+        return f"{exch}:{index}{yy}{mm}{dd}{ot}{strike}"
+    else:
+        # NSE drops leading zero on month: NSE:NIFTY25423CE24500
+        mm_nse = str(int(mm))
+        return f"{exch}:{index}{yy}{mm_nse}{dd}{ot}{strike}"
 
 
 def _fetch_candles(symbol: str, interval=1, date_str=None) -> pd.DataFrame:
