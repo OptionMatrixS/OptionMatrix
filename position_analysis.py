@@ -121,8 +121,20 @@ def render():
 
     if uploaded is not None:
         try:
-            df_raw = (pd.read_csv(uploaded) if uploaded.name.endswith(".csv")
-                      else pd.read_excel(uploaded))
+            if uploaded.name.endswith(".csv"):
+                # Try multiple encodings for CSV
+                raw_bytes = uploaded.read()
+                for enc in ["utf-8","latin-1","cp1252","utf-8-sig","iso-8859-1"]:
+                    try:
+                        import io as _io
+                        df_raw = pd.read_csv(_io.BytesIO(raw_bytes), encoding=enc)
+                        break
+                    except (UnicodeDecodeError, Exception):
+                        continue
+                else:
+                    raise ValueError("Could not decode CSV. Try saving as UTF-8.")
+            else:
+                df_raw = pd.read_excel(uploaded)
             df_raw = _clean_numeric(df_raw)
             df_raw["_row_id"] = range(len(df_raw))
             _SS.pos_df = df_raw
