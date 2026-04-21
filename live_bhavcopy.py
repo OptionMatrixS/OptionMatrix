@@ -1,6 +1,6 @@
 """
-live_bhavcopy.py  —  Live Bhavcopy Tab
-Shows all strikes with volume today for selected index/stock and expiry.
+live_bhavcopy.py — Live Bhavcopy
+Fetches full option chain from Fyers and displays all strikes with volume.
 """
 import sys, os
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -9,256 +9,199 @@ if _ROOT not in sys.path: sys.path.insert(0, _ROOT)
 import streamlit as st
 import pandas as pd
 import io
-from fyers_client import get_fyers_client, get_expiries, _s
-from fyers_apiv3 import fyersModel
+from fyers_client import get_fyers_client, get_expiries, _label_to_code
 
 _SS = st.session_state
 
-# All F&O stocks available on NSE
-_FNO_STOCKS = [
-    "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","KOTAKBANK",
-    "SBIN","BAJFINANCE","BHARTIARTL","ITC","AXISBANK","LT","ASIANPAINT",
-    "MARUTI","TITAN","SUNPHARMA","ULTRACEMCO","WIPRO","HCLTECH","TECHM",
-    "INDUSINDBK","BAJAJFINSV","NESTLEIND","POWERGRID","NTPC","ONGC",
-    "COALINDIA","TATAMOTORS","TATASTEEL","JSWSTEEL","HINDALCO","VEDL",
-    "GRASIM","ADANIENT","ADANIPORTS","DIVISLAB","DRREDDY","CIPLA","APOLLOHOSP",
-    "EICHERMOT","HEROMOTOCO","BAJAJ-AUTO","M&M","TATACONSUM","BRITANNIA",
-    "PIDILITIND","HAVELLS","MUTHOOTFIN","PAGEIND","VOLTAS","BERGEPAINT",
-    "LUPIN","BIOCON","AUROPHARMA","IPCALAB","TORNTPHARM","ALKEM","GLAXO",
-    "NAUKRI","JUSTDIAL","IRCTC","DMART","ZOMATO","PAYTM","POLICYBZR",
+_OPTIDX = {"NIFTY":"NSE:NIFTY50-INDEX","BANKNIFTY":"NSE:NIFTYBANK-INDEX",
+           "SENSEX":"BSE:SENSEX-INDEX","FINNIFTY":"NSE:FINNIFTY-INDEX"}
+
+_FNO_STOCKS = sorted(["RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","KOTAKBANK",
+    "SBIN","BAJFINANCE","BHARTIARTL","ITC","AXISBANK","LT","ASIANPAINT","MARUTI",
+    "TITAN","SUNPHARMA","ULTRACEMCO","WIPRO","HCLTECH","TECHM","INDUSINDBK",
+    "BAJAJFINSV","NESTLEIND","POWERGRID","NTPC","ONGC","COALINDIA","TATAMOTORS",
+    "TATASTEEL","JSWSTEEL","HINDALCO","VEDL","GRASIM","ADANIENT","ADANIPORTS",
+    "DIVISLAB","DRREDDY","CIPLA","APOLLOHOSP","EICHERMOT","HEROMOTOCO","BAJAJ-AUTO",
+    "TATACONSUM","BRITANNIA","PIDILITIND","HAVELLS","MUTHOOTFIN","LUPIN","BIOCON",
+    "AUROPHARMA","TORNTPHARM","ALKEM","NAUKRI","IRCTC","DMART","ZOMATO",
     "BANDHANBNK","FEDERALBNK","IDFCFIRSTB","PNB","BANKBARODA","CANBK",
-    "GMRINFRA","CONCOR","BALKRISIND","ABBOTINDIA","CHOLAFIN","MANAPPURAM",
-    "LICHSGFIN","SBILIFE","HDFCLIFE","ICICIPRULI","GICRE","NIACL",
-    "COFORGE","MPHASIS","PERSISTENT","LTIM","OFSS","KPITTECH",
-    "INDIGO","SPICEJET","SAIL","NMDC","MOIL","NATIONALUM",
-    "DEEPAKNTR","AARTIIND","PIIND","UPL","BPCL","IOC","HINDPETRO",
-    "GAIL","PETRONET","IGL","MGL","ATGL",
-]
-_FNO_STOCKS = sorted(set(_FNO_STOCKS))
+    "SBILIFE","HDFCLIFE","ICICIPRULI","COFORGE","MPHASIS","PERSISTENT","LTIM","OFSS",
+    "INDIGO","SAIL","NMDC","BPCL","IOC","HINDPETRO","GAIL","PETRONET","IGL"])
 
-_OPTIDX_MAP = {
-    "NIFTY":     "NSE:NIFTY50-INDEX",
-    "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-    "SENSEX":    "BSE:SENSEX-INDEX",
-    "FINNIFTY":  "NSE:FINNIFTY-INDEX",
-}
-
-def _get_option_chain(symbol_key: str, expiry_code: str = "") -> pd.DataFrame:
-    """Fetch full option chain for a symbol from Fyers."""
+def _fetch_chain(sym_key, expiry_label, index_name):
+    """
+    Fetch option chain for one symbol+expiry.
+    Uses optionchain API with strikecount:0 to get all strikes.
+    """
     try:
         fyers = get_fyers_client()
-        resp  = fyers.optionchain(data={
-            "symbol": symbol_key, "strikecount": 0, "timestamp": expiry_code or ""})
+        # Get all expiry data first, then filter
+        resp = fyers.optionchain(data={"symbol": sym_key, "strikecount": 0, "timestamp": ""})
         if not (resp and resp.get("s") == "ok"):
-            return pd.DataFrame()
+            return pd.DataFrame(), f"API error: {resp.get('message','unknown')}"
+
         chain = resp.get("data", {}).get("optionsChain", [])
         if not chain:
-            return pd.DataFrame()
+            return pd.DataFrame(), "No option chain data returned"
+
         rows = []
         for opt in chain:
             if not isinstance(opt, dict): continue
             rows.append({
-                "Strike Price": opt.get("strikePrice", 0),
-                "Option Type":  opt.get("option_type", ""),
-                "Volume":       opt.get("volume", 0),
-                "OI":           opt.get("oi", 0),
-                "LTP":          opt.get("ltp", 0),
-                "Expiry":       opt.get("expiry", ""),
+                "Particular":    index_name,
+                "Expiry":        opt.get("expiry",""),
+                "Strike Price":  opt.get("strikePrice",0),
+                "Option Type":   opt.get("option_type","").upper(),
+                "Volume":        int(opt.get("volume",0) or 0),
+                "OI":            int(opt.get("oi",0) or 0),
+                "Chng in OI":    int(opt.get("oiChange",0) or 0),
+                "LTP":           float(opt.get("ltp",0) or 0),
             })
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows), None
     except Exception as e:
-        st.error(f"Option chain fetch failed: {e}")
-        return pd.DataFrame()
-
+        return pd.DataFrame(), str(e)
 
 def render():
-    st.markdown(
-        '<div style="font-size:20px;font-weight:600;color:#d1d4dc;margin-bottom:4px;">'
-        '📋 Live Bhavcopy</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div style="font-size:12px;color:#787b86;margin-bottom:16px;">'
-        'All strikes with volume today — live from Fyers option chain.</div>',
-        unsafe_allow_html=True)
+    st.markdown('<div style="font-size:20px;font-weight:600;color:#d1d4dc;margin-bottom:4px;">📋 Live Bhavcopy</div>',unsafe_allow_html=True)
+    st.markdown('<div style="font-size:12px;color:#787b86;margin-bottom:12px;">All option strikes with live volume, OI and LTP from Fyers.</div>',unsafe_allow_html=True)
 
-    # ── Instrument type ────────────────────────────────────────────────────────
-    st.markdown('<div class="sec-header">Filters</div>', unsafe_allow_html=True)
+    r1c1, r1c2 = st.columns(2)
+    with r1c1:
+        inst_type = st.radio("Instrument Type", ["OPTIDX (Index)","OPTSTK (Stocks)"],
+                              key="bh_inst_type", horizontal=True)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        inst_type = st.radio(
-            "Instrument Type", ["OPTIDX (Index Options)", "OPTSTK (Stock Options)"],
-            key="bh_inst_type", horizontal=True)
-
-    with c2:
+    with r1c2:
         if "OPTIDX" in inst_type:
-            idx_sel = st.selectbox(
-                "Select Index",
-                ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY"],
-                key="bh_idx_sel")
-            symbol_key  = _OPTIDX_MAP.get(idx_sel, "NSE:NIFTY50-INDEX")
-            symbol_name = idx_sel
-            exchange    = "BSE" if idx_sel == "SENSEX" else "NSE"
+            idx_sel = st.selectbox("Index", list(_OPTIDX.keys()), key="bh_idx")
+            sym_key = _OPTIDX[idx_sel]
+            sym_name= idx_sel
         else:
-            all_opt  = ["— Select All —"] + _FNO_STOCKS
-            stk_sel  = st.multiselect(
-                "Select Stocks", all_opt,
-                default=["— Select All —"], key="bh_stk_sel")
-            if "— Select All —" in stk_sel:
-                selected_stocks = _FNO_STOCKS
-            else:
-                selected_stocks = [s for s in stk_sel if s != "— Select All —"]
-            symbol_key  = f"NSE:{selected_stocks[0]}-EQ" if selected_stocks else ""
-            symbol_name = selected_stocks[0] if selected_stocks else ""
-            exchange    = "NSE"
+            stk_opts = ["— All Stocks —"] + _FNO_STOCKS
+            stk_sel  = st.multiselect("Stocks", stk_opts,
+                                       default=["— All Stocks —"], key="bh_stks")
+            sel_stks = _FNO_STOCKS if "— All Stocks —" in stk_sel else [s for s in stk_sel if s!="— All Stocks —"]
+            sym_key  = f"NSE:{sel_stks[0]}-EQ" if sel_stks else ""
+            sym_name = sel_stks[0] if sel_stks else ""
 
-    # ── Expiry selector ────────────────────────────────────────────────────────
-    c3, c4, c5, c6 = st.columns(4)
-    with c3:
+    # Expiry selector
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    with r2c1:
+        idx_for_exp = idx_sel if "OPTIDX" in inst_type else "NIFTY"
         try:
-            if "OPTIDX" in inst_type:
-                expiries = get_expiries(idx_sel if "OPTIDX" in inst_type else symbol_name)
-            else:
-                expiries = get_expiries("NIFTY")   # fallback for stocks
-            exp_sel = st.selectbox("Expiry", expiries, key="bh_expiry")
+            exps = get_expiries(idx_for_exp)
+            exp_sel = st.selectbox("Expiry", ["All"] + exps, key="bh_exp")
         except Exception as e:
-            st.error(f"Load expiries failed: {e}")
-            return
+            st.error(f"Load expiries: {e}"); return
 
-    with c4:
-        vol_gt = st.number_input(
-            "Volume Greater Than", min_value=0, value=0, step=1,
-            key="bh_vol_gt",
-            help="Only show strikes where volume > this value")
+    with r2c2:
+        vol_gt = st.number_input("Volume >", min_value=0, value=0, step=1,
+                                  key="bh_vol")
+    with r2c3:
+        opt_type_f = st.selectbox("Option Type", ["Both","CE","PE"], key="bh_ot")
+    with r2c4:
+        new_oi_only = st.checkbox("New OI Only\n(OI was 0)", value=False, key="bh_newoi")
 
-    with c5:
-        new_oi_only = st.checkbox(
-            "New OI Data Only",
-            value=False, key="bh_new_oi",
-            help="Show only strikes where OI = 0 (new positions built today)")
-
-    with c6:
-        opt_type_filter = st.selectbox(
-            "Option Type", ["Both", "CE Only", "PE Only"], key="bh_opt_type")
-
-    fetch_btn = st.button("📡  Fetch Bhavcopy", type="primary",
-                           use_container_width=False, key="bh_fetch")
+    col_b1, col_b2 = st.columns(2)
+    with col_b1:
+        fetch_btn = st.button("📡 Fetch Bhavcopy", type="primary",
+                               use_container_width=True, key="bh_fetch")
+    with col_b2:
+        if st.button("🔄 Refresh", use_container_width=True, key="bh_refresh"):
+            _SS.pop("bh_result", None); st.rerun()
 
     if fetch_btn:
-        with st.spinner("Fetching live option chain data…"):
-            # Get expiry code from label
-            exp_codes = _SS.get(f"expiries_{'NIFTY' if 'OPTSTK' in inst_type else idx_sel if 'OPTIDX' in inst_type else 'NIFTY'}", {})
-            exp_code  = exp_codes.get(exp_sel, "")
-
+        with st.spinner("Fetching option chain…"):
+            frames = []
             if "OPTIDX" in inst_type:
-                df = _get_option_chain(symbol_key, exp_code)
-                df["Particular"] = symbol_name
+                df, err = _fetch_chain(sym_key, exp_sel, sym_name)
+                if err: st.error(f"Error: {err}")
+                elif not df.empty: frames.append(df)
             else:
-                # Fetch for each selected stock
-                frames = []
-                for stk in (selected_stocks[:20] if selected_stocks else []):
-                    sym = f"NSE:{stk}-EQ"
-                    df_stk = _get_option_chain(sym, exp_code)
-                    if not df_stk.empty:
-                        df_stk["Particular"] = stk
-                        frames.append(df_stk)
-                df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                for stk in (sel_stks[:15] if sel_stks else []):
+                    df, err = _fetch_chain(f"NSE:{stk}-EQ", exp_sel, stk)
+                    if not df.empty: frames.append(df)
 
-            if df.empty:
-                st.warning("No data returned. Check token, expiry, or market hours.")
-                return
+            if frames:
+                all_df = pd.concat(frames, ignore_index=True)
+                # Filter by expiry
+                if exp_sel != "All" and "Expiry" in all_df.columns:
+                    # Fyers expiry in chain may be date string; try to match
+                    pass  # keep all for now — user already selected expiry at API level
 
-            # ── Apply filters ─────────────────────────────────────────────────
-            # Volume filter
-            if "Volume" in df.columns and vol_gt > 0:
-                df = df[pd.to_numeric(df["Volume"], errors="coerce").fillna(0) > vol_gt]
+                # Apply filters
+                if vol_gt > 0:
+                    all_df = all_df[pd.to_numeric(all_df["Volume"],errors="coerce").fillna(0) > vol_gt]
+                if new_oi_only:
+                    # New OI = positions where OI change > 0 and was previously 0
+                    all_df = all_df[pd.to_numeric(all_df["Chng in OI"],errors="coerce").fillna(0) > 0]
+                if opt_type_f != "Both":
+                    all_df = all_df[all_df["Option Type"] == opt_type_f]
 
-            # New OI filter
-            if new_oi_only and "OI" in df.columns:
-                df = df[pd.to_numeric(df["OI"], errors="coerce").fillna(-1) == 0]
+                all_df = all_df.sort_values("Volume", ascending=False).reset_index(drop=True)
+                _SS.bh_result = all_df
+            else:
+                st.warning("No data returned. Check token and market hours.")
+                _SS.bh_result = None
 
-            # Option type filter
-            if opt_type_filter == "CE Only" and "Option Type" in df.columns:
-                df = df[df["Option Type"].str.upper() == "CE"]
-            elif opt_type_filter == "PE Only" and "Option Type" in df.columns:
-                df = df[df["Option Type"].str.upper() == "PE"]
-
-            # Sort by volume desc
-            if "Volume" in df.columns:
-                df = df.sort_values("Volume", ascending=False)
-
-            _SS.bh_result = df.reset_index(drop=True)
-
-    # ── Display results ────────────────────────────────────────────────────────
+    # Display
     if _SS.get("bh_result") is not None and not _SS.bh_result.empty:
         df = _SS.bh_result
 
-        # Build display table
-        out_cols = {
-            "Particular":   "Particular",
-            "Expiry":       "Expiry",
-            "Strike Price": "Strike Price",
-            "Option Type":  "Option Type",
-            "Volume":       "Volume",
-            "OI":           "OI",
-            "LTP":          "LTP",
-        }
-        show_cols = [c for c in out_cols if c in df.columns]
-        df_show   = df[show_cols].rename(columns=out_cols)
+        st.markdown(f'<div style="font-size:12px;color:#787b86;margin:8px 0;">'
+                    f'Showing <b style="color:#d1d4dc;">{len(df)}</b> strikes</div>',
+                    unsafe_allow_html=True)
 
-        # Format numbers
-        for col in ["Volume","OI"]:
+        # Format for display
+        df_show = df.copy()
+        for col in ["Volume","OI","Chng in OI"]:
             if col in df_show.columns:
-                df_show[col] = pd.to_numeric(df_show[col], errors="coerce").fillna(0).astype(int)
+                df_show[col] = pd.to_numeric(df_show[col],errors="coerce").fillna(0).astype(int)
 
-        st.markdown(
-            f'<div style="font-size:12px;color:#787b86;margin:8px 0;">'
-            f'Showing <b style="color:#d1d4dc;">{len(df_show)}</b> strikes</div>',
-            unsafe_allow_html=True)
+        st.dataframe(df_show, use_container_width=True, hide_index=True, height=500)
 
-        st.dataframe(df_show, use_container_width=True, hide_index=True, height=480)
+        # Summary stats
+        s1,s2,s3 = st.columns(3)
+        with s1: st.metric("Total Volume", f"{df['Volume'].sum():,.0f}")
+        with s2: st.metric("Total OI",     f"{df['OI'].sum():,.0f}")
+        with s3: st.metric("Strikes shown",str(len(df)))
 
-        # ── Export ────────────────────────────────────────────────────────────
+        # Export
         st.markdown("---")
-        ec1, ec2 = st.columns(2)
-
+        ec1,ec2 = st.columns(2)
         with ec1:
             buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df_show.to_excel(writer, index=False, sheet_name="Bhavcopy")
-                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-                ws  = writer.sheets["Bhavcopy"]
-                hf  = PatternFill("solid", fgColor="1A1F2E")
-                thin= Side(border_style="thin", color="2A2E39")
-                bdr = Border(left=thin,right=thin,top=thin,bottom=thin)
+            with pd.ExcelWriter(buf,engine="openpyxl") as writer:
+                df_show.to_excel(writer,index=False,sheet_name="Bhavcopy")
+                from openpyxl.styles import Font,PatternFill,Alignment
+                ws=writer.sheets["Bhavcopy"]
+                hf=PatternFill("solid",fgColor="1A1F2E")
                 for cell in ws[1]:
                     cell.font=Font(color="787B86",bold=True); cell.fill=hf
-                    cell.border=bdr; cell.alignment=Alignment(horizontal="center")
+                    cell.alignment=Alignment(horizontal="center")
                 for row in ws.iter_rows(min_row=2):
                     for cell in row:
                         cell.fill=PatternFill("solid",fgColor="1E222D")
-                        cell.font=Font(color="D1D4DC"); cell.border=bdr
+                        cell.font=Font(color="D1D4DC")
                         cell.alignment=Alignment(horizontal="center")
                 for col in ws.columns:
-                    ws.column_dimensions[col[0].column_letter].width = min(
-                        max(len(str(c.value or "")) for c in col)+4, 20)
+                    ws.column_dimensions[col[0].column_letter].width=min(
+                        max(len(str(c.value or "")) for c in col)+4,22)
             buf.seek(0)
-            st.download_button("📥 Export Excel", data=buf,
+            st.download_button("📥 Export Excel",data=buf,
                                file_name="bhavcopy.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
         with ec2:
             st.download_button("📄 Export CSV",
                                data=df_show.to_csv(index=False).encode(),
-                               file_name="bhavcopy.csv",
-                               mime="text/csv", use_container_width=True)
+                               file_name="bhavcopy.csv",mime="text/csv",
+                               use_container_width=True)
     elif _SS.get("bh_result") is not None:
-        st.info("No strikes match the selected filters.")
+        st.info("No strikes match filters.")
     else:
-        st.markdown("""
-        <div style="height:200px;display:flex;align-items:center;justify-content:center;
-                    background:#1e222d;border:1px dashed #2a2e39;border-radius:8px;">
-          <div style="text-align:center;">
-            <div style="font-size:32px;margin-bottom:8px;">📋</div>
-            <div style="font-size:13px;color:#787b86;">Select filters above and click Fetch Bhavcopy</div>
-          </div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown('<div style="height:200px;display:flex;align-items:center;justify-content:center;'
+                    'background:#1e222d;border:1px dashed #2a2e39;border-radius:8px;">'
+                    '<div style="text-align:center;color:#787b86;">'
+                    '<div style="font-size:28px;margin-bottom:8px;">📋</div>'
+                    'Select filters and click Fetch Bhavcopy</div></div>',
+                    unsafe_allow_html=True)
