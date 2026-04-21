@@ -198,7 +198,10 @@ def render():
         df_for_strikes = df_raw.copy()
         if sel_ids and "ID" in df_for_strikes.columns:
             df_for_strikes = df_for_strikes[df_for_strikes["ID"].isin(sel_ids)]
-        avail_strikes = sorted([int(x) for x in df_for_strikes["Strike Price"].dropna().unique() if x > 0])
+        def _to_int(x):
+            try: v=float(str(x).replace(",","")); return int(v) if v>0 else None
+            except: return None
+        avail_strikes = sorted([v for v in (_to_int(x) for x in df_for_strikes["Strike Price"].dropna().unique()) if v])
         if avail_strikes:
             strike_filter_vals = st.multiselect(
                 "Strike Price", avail_strikes, default=avail_strikes, key="pos_strikes",
