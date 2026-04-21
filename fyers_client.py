@@ -122,21 +122,39 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
             )
 
         # ── Step 4: verify PIN ────────────────────────────────────────────────
-        # PIN is sent as plain string (NOT base64) — this is what Fyers expects
-        r3 = _req.post(
-            URL_VERIFY_PIN,
-            json={
-                "request_key":   d2["request_key"],
-                "identity_type": "pin",
-                "identifier":    str(pin),     # plain string, NOT base64
-            },
-            timeout=15)
-        try:
-            d3 = r3.json()
-        except Exception:
-            return None, f"Step 4 bad response: {r3.text[:200]}"
-        if d3.get("s") != "ok":
-            return None, f"Step 4 (verify PIN) failed: {d3} — check FYERS_PIN"
+        # Fyers accounts differ — try all 3 PIN encodings until one works.
+        # Some accounts need base64, some need SHA-256, some need plain string.
+        import hashlib as _hashlib
+        _pin_variants = [
+            base64.b64encode(str(pin).encode()).decode(),   # base64 (most common)
+            _hashlib.sha256(str(pin).encode()).hexdigest(), # sha256
+            str(pin),                                       # plain string
+        ]
+        d3 = None
+        for _pin_enc in _pin_variants:
+            r3 = _req.post(
+                URL_VERIFY_PIN,
+                json={
+                    "request_key":   d2["request_key"],
+                    "identity_type": "pin",
+                    "identifier":    _pin_enc,
+                },
+                timeout=15)
+            try:
+                d3 = r3.json()
+            except Exception:
+                continue
+            if d3.get("s") == "ok":
+                break   # this encoding worked
+            # -1006 = wrong encoding, try next; other errors = stop
+            if d3.get("code") != -1006:
+                break
+        if not d3 or d3.get("s") != "ok":
+            return None, (
+                f"Step 4 (verify PIN) failed: {d3}
+"
+                "Check FYERS_PIN in Streamlit secrets is your 4-digit Fyers login PIN."
+            )
 
         access_token_step4 = d3["data"]["access_token"]
 
