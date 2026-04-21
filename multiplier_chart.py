@@ -40,7 +40,9 @@ def render():
         n_strike = st.selectbox("NIFTY Strike", n_strikes, index=n_strikes.index(n_def) if n_def in n_strikes else 0, key="mx_n_str")
         tf       = st.selectbox("Timeframe", list(TF_MAP.keys()), key="mx_tf")
 
-        if st.button("📡  Plot Multiplier", use_container_width=True, type="primary"):
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+         if st.button("📡  Plot Multiplier", use_container_width=True, type="primary"):
             with st.spinner("Fetching live data…"):
                 try:
                     df = get_multiplier_series(sx_strike, sx_exp, n_strike, n_exp, tf_minutes=TF_MAP[tf])
@@ -49,6 +51,9 @@ def render():
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
+        with col_b2:
+         if st.button("🔄 Refresh", use_container_width=True, key="mx_refresh"):
+            _SS.mx_result=None; st.rerun()
 
         if _SS.mx_result:
             df = _SS.mx_result["df"]
