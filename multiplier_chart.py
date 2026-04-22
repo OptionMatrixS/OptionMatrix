@@ -12,6 +12,20 @@ def render():
     if "mx_result" not in _SS: _SS.mx_result = None
 
     st.markdown('<div style="font-size:20px;font-weight:600;color:#d1d4dc;margin-bottom:8px;">✖️ Multiplier Chart</div>', unsafe_allow_html=True)
+    # ── Refresh controls ─────────────────────────────────────────────────────
+    _rc1, _rc2, _rc3 = st.columns([2,1,1])
+    with _rc2:
+        auto_ref = st.toggle("🔴 Auto Refresh", value=False, key="mx_auto_ref",
+                              help="Refreshes every 30 seconds")
+    with _rc3:
+        if st.button("🔄 Refresh Now", key="mx_ref_now", use_container_width=True):
+            st.rerun()
+    if auto_ref:
+        import time as _time
+        _time.sleep(30)
+        st.rerun()
+
+
     st.markdown('<div style="font-size:12px;color:#787b86;margin-bottom:16px;">'
                 'Tracks: <code style="color:#2962ff;background:#1e222d;padding:1px 5px;border-radius:3px;">'
                 '(SX_strike + SX_CE − SX_PE) ÷ (N_strike + N_CE − N_PE)</code></div>', unsafe_allow_html=True)
