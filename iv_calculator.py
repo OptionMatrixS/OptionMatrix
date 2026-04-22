@@ -14,6 +14,20 @@ def render():
     if "iv_result" not in _SS: _SS.iv_result = None
 
     st.markdown('<div style="font-size:20px;font-weight:600;color:#d1d4dc;margin-bottom:4px;">🌡️ IV Calculator</div>', unsafe_allow_html=True)
+    # ── Refresh controls ─────────────────────────────────────────────────────
+    _rc1, _rc2, _rc3 = st.columns([2,1,1])
+    with _rc2:
+        auto_ref = st.toggle("🔴 Auto Refresh", value=False, key="iv_auto_ref",
+                              help="Refreshes every 30 seconds")
+    with _rc3:
+        if st.button("🔄 Refresh Now", key="iv_ref_now", use_container_width=True):
+            st.rerun()
+    if auto_ref:
+        import time as _time
+        _time.sleep(30)
+        st.rerun()
+
+
     st.markdown('<div style="font-size:12px;color:#787b86;margin-bottom:16px;">Implied Volatility — Black-Scholes. Up to 5 expiries.</div>', unsafe_allow_html=True)
 
     ctrl_col, chart_col = st.columns([1, 2.5], gap="medium")
