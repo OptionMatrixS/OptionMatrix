@@ -131,6 +131,20 @@ def render():
     st.markdown(
         '<div style="font-size:20px;font-weight:600;color:#d1d4dc;margin-bottom:4px;">'
         '🕰️ Historical Backtest</div>', unsafe_allow_html=True)
+    # ── Refresh controls ─────────────────────────────────────────────────────
+    _rc1, _rc2, _rc3 = st.columns([2,1,1])
+    with _rc2:
+        auto_ref = st.toggle("🔴 Auto Refresh", value=False, key="hb_auto_ref",
+                              help="Refreshes every 30 seconds")
+    with _rc3:
+        if st.button("🔄 Refresh Now", key="hb_ref_now", use_container_width=True):
+            st.rerun()
+    if auto_ref:
+        import time as _time
+        _time.sleep(30)
+        st.rerun()
+
+
     st.markdown(
         '<div style="font-size:12px;color:#787b86;margin-bottom:16px;">'
         'Replay any past trading day — fetches historical intraday candles from Fyers '
