@@ -217,35 +217,34 @@ def refresh_token():
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(ttl=1800)
 def _fetch_expiry_map(token: str, cid: str, sym: str) -> dict:
-    """Fetch and cache expiry map for one symbol."""
-    try:
-        fyers = fyersModel.FyersModel(client_id=cid, token=token, log_path="")
-        resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 1, "timestamp": ""})
-        if not (resp and resp.get("s") == "ok"):
-            return {}
-        raw = resp.get("data", {}).get("expiryData", [])
-        parsed = []
-        for e in raw:
-            if not isinstance(e, dict): continue
-            try:
-                dd, mm, yy4 = e["date"].split("-")
-                dd, mm, yy4 = int(dd), int(mm), int(yy4)
-            except Exception:
-                continue
-            parsed.append((yy4 % 100, mm, dd, _MONTHS[mm-1]))
-        by_month = defaultdict(list)
-        for yy, mm, dd, mon in parsed:
-            by_month[(yy, mm)].append(dd)
-        last_day = {k: max(v) for k, v in by_month.items()}
-        result = {}
-        for yy, mm, dd, mon in parsed:
-            is_m  = (dd == last_day[(yy, mm)])
-            code  = f"{yy:02d}{mon}" if is_m else f"{yy:02d}{mm:02d}{dd:02d}"
-            label = f"{dd:02d} {mon} {yy:02d} ({'M' if is_m else 'W'})"
-            result[label] = code
-        return result
-    except Exception:
-        return {}
+    """Fetch and cache expiry map for one symbol. Raises on failure so empty results are NOT cached."""
+    fyers = fyersModel.FyersModel(client_id=cid, token=token, log_path="")
+    resp  = fyers.optionchain(data={"symbol": sym, "strikecount": 1, "timestamp": ""})
+    if not (resp and resp.get("s") == "ok"):
+        raise RuntimeError(f"optionchain failed: {resp}")
+    raw = resp.get("data", {}).get("expiryData", [])
+    parsed = []
+    for e in raw:
+        if not isinstance(e, dict): continue
+        try:
+            dd, mm, yy4 = e["date"].split("-")
+            dd, mm, yy4 = int(dd), int(mm), int(yy4)
+        except Exception:
+            continue
+        parsed.append((yy4 % 100, mm, dd, _MONTHS[mm-1]))
+    if not parsed:
+        raise RuntimeError(f"No expiry dates parsed from response for {sym}")
+    by_month = defaultdict(list)
+    for yy, mm, dd, mon in parsed:
+        by_month[(yy, mm)].append(dd)
+    last_day = {k: max(v) for k, v in by_month.items()}
+    result = {}
+    for yy, mm, dd, mon in parsed:
+        is_m  = (dd == last_day[(yy, mm)])
+        code  = f"{yy:02d}{mon}" if is_m else f"{yy:02d}{mm:02d}{dd:02d}"
+        label = f"{dd:02d} {mon} {yy:02d} ({'M' if is_m else 'W'})"
+        result[label] = code
+    return result
 
 
 def get_expiries(index: str) -> list:
@@ -255,12 +254,24 @@ def get_expiries(index: str) -> list:
     tok  = get_token()
     cid  = _s("FYERS_CLIENT_ID")
     sym  = _UNDERLYING_SYM.get(index.upper(), f"NSE:{index}-INDEX")
-    data = _fetch_expiry_map(tok, cid, sym)
+    try:
+        data = _fetch_expiry_map(tok, cid, sym)
+    except Exception as e:
+        # Clear the cache so next call retries fresh
+        try: _fetch_expiry_map.clear()
+        except Exception: pass
+        raise ValueError(
+            f"Load expiries failed for {index}: {e}\n"
+            "Make sure FYERS_ACCESS_TOKEN is today's token. "
+            "Click 🔄 Refresh Token in sidebar."
+        )
     if not data:
+        try: _fetch_expiry_map.clear()
+        except Exception: pass
         raise ValueError(
             f"No expiries returned for {index}.\n"
-            "If using FYERS_ACCESS_TOKEN, make sure it is today's token.\n"
-            "Click 🔄 Refresh Token in sidebar to retry."
+            "Make sure FYERS_ACCESS_TOKEN is today's token. "
+            "Click 🔄 Refresh Token in sidebar."
         )
     st.session_state[ck] = data
     return list(data.keys())
