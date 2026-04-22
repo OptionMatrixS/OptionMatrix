@@ -240,6 +240,20 @@ def render():
     _init()
     st.markdown('<div style="font-size:20px;font-weight:600;color:#d1d4dc;margin-bottom:8px;">📊 Spread Chart</div>',
                 unsafe_allow_html=True)
+    # ── Refresh controls ─────────────────────────────────────────────────────
+    _rc1, _rc2, _rc3 = st.columns([2,1,1])
+    with _rc2:
+        auto_ref = st.toggle("🔴 Auto Refresh", value=False, key="sc_auto_ref",
+                              help="Refreshes every 30 seconds")
+    with _rc3:
+        if st.button("🔄 Refresh Now", key="sc_ref_now", use_container_width=True):
+            st.rerun()
+    if auto_ref:
+        import time as _time
+        _time.sleep(30)
+        st.rerun()
+
+
 
     # ── Chart ──────────────────────────────────────────────────────────────────
     if _SS.sp_df is not None:
