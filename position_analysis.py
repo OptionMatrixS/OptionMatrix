@@ -212,9 +212,18 @@ def render():
     if sel_ids    and "ID"          in df.columns: df = df[df["ID"].isin(sel_ids)]
     if sel_und    and "Underlying"  in df.columns: df = df[df["Underlying"].isin(sel_und)]
     if sel_type   and "Scrip Type"  in df.columns: df = df[df["Scrip Type"].isin(sel_type)]
-    if sel_expiries and "Expiry Date" in df.columns: df = df[df["Expiry Date"].isin(sel_expiries)]
+    if sel_expiries and "Expiry Date" in df.columns:
+        try:
+            sel_ts = [pd.Timestamp(e) for e in sel_expiries]
+            df["Expiry Date"] = pd.to_datetime(df["Expiry Date"], errors="coerce")
+            df = df[df["Expiry Date"].isin(sel_ts)]
+        except Exception:
+            pass
     if strike_filter_vals and "Strike Price" in df.columns:
-        df = df[df["Strike Price"].isin(strike_filter_vals)]
+        def _norm_strike(x):
+            try: return int(float(str(x).replace(",","")))
+            except: return None
+        df = df[df["Strike Price"].apply(_norm_strike).isin(strike_filter_vals)]
 
     sort_cols = [c for c in ["Underlying", "Expiry Date", "Strike Price"] if c in df.columns]
     if sort_cols: df = df.sort_values(sort_cols)
@@ -482,9 +491,13 @@ def render():
                 try: exp = pd.to_datetime(row.get("Expiry Date")).strftime("%d %b")
                 except: pass
                 clr = "#2962ff" if str(cp).upper()=="CE" else "#ff9800"
+                try:
+                    stk_disp = str(int(float(str(stk).replace(",","")))) if stk and not (isinstance(stk,float) and pd.isna(stk)) else str(stk)
+                except Exception:
+                    stk_disp = str(stk)
                 preview_html += (
                     f'<div style="font-size:11px;color:#d1d4dc;padding:2px 0;">'
-                    f'{und} <b style="color:{clr};">{int(stk) if not pd.isna(stk) else stk}</b> '
+                    f'{und} <b style="color:{clr};">{stk_disp}</b> '
                     f'<span style="color:{clr};">{cp}</span> {exp}</div>'
                 )
             st.markdown(
