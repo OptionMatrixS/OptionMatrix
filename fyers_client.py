@@ -1,5 +1,3 @@
-cat > /mnt/user-data/outputs/option_matrix/fyers_client.py << 'PYEOF'
-"""
 fyers_client.py — Option Matrix
 ================================
 TWO auth modes:
@@ -513,5 +511,3 @@ def render_debug_panel():
                 try: st.success(f"NIFTY:{get_spot_price('NIFTY')}")
                 except Exception as e: st.error(str(e))
         else: st.error("No FYERS_ACCESS_TOKEN in secrets.")
-PYEOF
-python3 -c "import ast; ast.parse(open('/mnt/user-data/outputs/option_matrix/fyers_client.py').read()); print('✓ fyers_client OK')"
