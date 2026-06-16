@@ -1,136 +1,2821 @@
-import sys, os
-_ROOT = os.path.dirname(os.path.abspath(__file__))
-if _ROOT not in sys.path: sys.path.insert(0, _ROOT)
+"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
 
 import streamlit as st
 import plotly.graph_objects as go
-from data_helpers import get_nifty_expiries, get_sensex_expiries, get_nifty_strikes, get_sensex_strikes, get_multiplier_series, TF_MAP
+import pandas as pd
 
-_SS = st.session_state
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
 
-def render():
-    if "mx_result" not in _SS: _SS.mx_result = None
 
-    st.markdown('<div style="font-size:20px;font-weight:600;color:#d1d4dc;margin-bottom:8px;">✖️ Multiplier Chart</div>', unsafe_allow_html=True)
-    # ── Refresh controls ─────────────────────────────────────────────────────
-    _rc1, _rc2, _rc3 = st.columns([2,1,1])
-    with _rc2:
-        auto_ref = st.toggle("🔴 Auto Refresh", value=False, key="mx_auto_ref",
-                              help="Refreshes every 30 seconds")
-    with _rc3:
-        if st.button("🔄 Refresh Now", key="mx_ref_now", use_container_width=True):
-            st.rerun()
-    if auto_ref:
-        import time as _time
-        _time.sleep(30)
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
         st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
 
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
 
-    st.markdown('<div style="font-size:12px;color:#787b86;margin-bottom:16px;">'
-                'Tracks: <code style="color:#2962ff;background:#1e222d;padding:1px 5px;border-radius:3px;">'
-                '(SX_strike + SX_CE − SX_PE) ÷ (N_strike + N_CE − N_PE)</code></div>', unsafe_allow_html=True)
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
 
-    ctrl_col, chart_col = st.columns([1, 2.5], gap="medium")
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
 
-    with ctrl_col:
-        st.markdown('<div class="sec-header">SENSEX</div>', unsafe_allow_html=True)
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
         try:
-            sx_exps = get_sensex_expiries()
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
         except Exception as e:
-            st.error(f"Load expiries failed: {e}"); return
-        sx_exp    = st.selectbox("SENSEX Expiry", sx_exps, key="mx_sx_exp")
-        sx_strikes= get_sensex_strikes(sx_exp)
-        sx_def    = min(sx_strikes, key=lambda x: abs(x-82500)) if sx_strikes else 82000
-        sx_strike = st.selectbox("SENSEX Strike", sx_strikes, index=sx_strikes.index(sx_def) if sx_def in sx_strikes else 0, key="mx_sx_str")
+            st.error(f"Fetch error: {e}")
 
-        st.markdown('<div class="sec-header" style="margin-top:12px;">NIFTY</div>', unsafe_allow_html=True)
-        try:
-            n_exps = get_nifty_expiries()
-        except Exception as e:
-            st.error(f"Load expiries failed: {e}"); return
-        n_exp    = st.selectbox("NIFTY Expiry", n_exps, key="mx_n_exp")
-        n_strikes= get_nifty_strikes(n_exp)
-        n_def    = min(n_strikes, key=lambda x: abs(x-22800)) if n_strikes else 22800
-        n_strike = st.selectbox("NIFTY Strike", n_strikes, index=n_strikes.index(n_def) if n_def in n_strikes else 0, key="mx_n_str")
-        tf       = st.selectbox("Timeframe", list(TF_MAP.keys()), key="mx_tf")
-
-        col_b1, col_b2 = st.columns(2)
-        with col_b1:
-         if st.button("📡  Plot Multiplier", use_container_width=True, type="primary"):
-            with st.spinner("Fetching live data…"):
-                try:
-                    df = get_multiplier_series(sx_strike, sx_exp, n_strike, n_exp, tf_minutes=TF_MAP[tf])
-                    _SS.mx_result = dict(df=df, sx_strike=sx_strike, sx_exp=sx_exp,
-                                          n_strike=n_strike, n_exp=n_exp, tf=tf)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
-        with col_b2:
-         if st.button("🔄 Refresh", use_container_width=True, key="mx_refresh"):
-            _SS.mx_result=None; st.rerun()
-
-        if _SS.mx_result:
-            df = _SS.mx_result["df"]
-            last = df["multiplier"].iloc[-1]; avg = df["multiplier"].mean()
-            hi = df["multiplier"].max(); lo = df["multiplier"].min()
-            chg = last - df["multiplier"].iloc[0]
-            st.markdown("---")
-            for label,val,color in [
-                ("Multiplier",f"{last:.4f}","#26a69a" if chg>=0 else "#ef5350"),
-                ("Change",f"{chg:+.4f}","#26a69a" if chg>=0 else "#ef5350"),
-                ("Average",f"{avg:.4f}","#d1d4dc"),
-                ("High",f"{hi:.4f}","#26a69a"),
-                ("Low",f"{lo:.4f}","#ef5350"),
-            ]:
-                st.markdown(f'<div style="background:#1e222d;border:1px solid #2a2e39;border-radius:5px;'
-                            f'padding:7px 12px;margin-bottom:4px;display:flex;justify-content:space-between;">'
-                            f'<span style="font-size:11px;color:#787b86;">{label}</span>'
-                            f'<span style="font-size:12px;font-weight:500;color:{color};">{val}</span></div>',
-                            unsafe_allow_html=True)
-
-    with chart_col:
-        if not _SS.mx_result:
-            st.markdown('<div style="height:480px;display:flex;align-items:center;justify-content:center;'
-                        'background:#1e222d;border:1px solid #2a2e39;border-radius:8px;">'
-                        '<div style="font-size:14px;color:#787b86;">Configure and click Plot Multiplier</div></div>',
-                        unsafe_allow_html=True); return
-        r = _SS.mx_result; df = r["df"]
-        last = df["multiplier"].iloc[-1]; first = df["multiplier"].iloc[0]
-        lc = "#26a69a" if last>=first else "#ef5350"
-        avg = df["multiplier"].mean()
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
         fig = go.Figure()
-        fig.add_hline(y=avg, line=dict(color="#787b86",width=1,dash="dash"),
-                      annotation_text=f"Avg {avg:.4f}",
-                      annotation_font=dict(size=10,color="#787b86"),annotation_position="right")
-        fig.add_trace(go.Scatter(x=df["time"],y=df["multiplier"],mode="lines",name="Multiplier",
-            line=dict(color=lc,width=2),fill="tozeroy",
-            fillcolor=f"rgba({'38,166,154' if lc=='#26a69a' else '239,83,80'},0.07)"))
-        fig.add_annotation(x=df["time"].iloc[-1],y=last,text=f" {last:.4f}",
-            showarrow=False,font=dict(size=11,color="#fff"),bgcolor=lc,borderpad=4,xanchor="left")
-        title = f"SENSEX {r['sx_strike']} ({r['sx_exp']}) / NIFTY {r['n_strike']} ({r['n_exp']}) — [{r['tf']}]"
-        fig.update_layout(title=dict(text=title,font=dict(size=12,color="#d1d4dc"),x=0),
-            paper_bgcolor="#131722",plot_bgcolor="#131722",
-            xaxis=dict(gridcolor="#1e222d",tickfont=dict(size=10,color="#787b86"),
-                       rangeslider=dict(visible=False),showline=False,zeroline=False,fixedrange=False),
-            yaxis=dict(gridcolor="#1e222d",tickfont=dict(size=10,color="#787b86"),
-                       showline=False,zeroline=False,side="right",fixedrange=False),
-            margin=dict(l=10,r=80,t=40,b=28),height=400,hovermode="x unified",dragmode="pan",
-            hoverlabel=dict(bgcolor="#1e222d",bordercolor="#2a2e39",font=dict(size=11,color="#d1d4dc")))
-        st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":True,"displaylogo":False,"scrollZoom":True})
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
 
-        # Synthetic sub-chart
+        # Sub-charts: synthetic prices
         fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=df["time"],y=df["sx_synth"],mode="lines",
-            name="SENSEX Synthetic",line=dict(color="#4caf50",width=1.5),yaxis="y1"))
-        fig2.add_trace(go.Scatter(x=df["time"],y=df["n_synth"],mode="lines",
-            name="NIFTY Synthetic",line=dict(color="#9c27b0",width=1.5,dash="dash"),yaxis="y2"))
-        fig2.update_layout(paper_bgcolor="#131722",plot_bgcolor="#131722",
-            xaxis=dict(gridcolor="#1e222d",tickfont=dict(size=10,color="#787b86"),showline=False,zeroline=False),
-            yaxis=dict(side="left",tickfont=dict(size=9,color="#4caf50"),showline=False,zeroline=False,gridcolor="#1e222d",
-                       title=dict(text="SENSEX",font=dict(size=10,color="#4caf50"))),
-            yaxis2=dict(overlaying="y",side="right",tickfont=dict(size=9,color="#9c27b0"),showline=False,zeroline=False,
-                        title=dict(text="NIFTY",font=dict(size=10,color="#9c27b0"))),
-            legend=dict(font=dict(size=11,color="#d1d4dc"),bgcolor="#1e222d",bordercolor="#2a2e39",borderwidth=1),
-            margin=dict(l=10,r=80,t=10,b=28),height=200,hovermode="x unified",
-            hoverlabel=dict(bgcolor="#1e222d",bordercolor="#2a2e39",font=dict(size=11,color="#d1d4dc")))
-        st.plotly_chart(fig2,use_container_width=True,config={"displayModeBar":False,"displaylogo":False})
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()"""
+Tab 2 — Multiplier Chart (SENSEX/NIFTY Synthetic Futures Ratio)
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+from fyers_data import (
+    fetch_option_chain, parse_option_chain, build_symbol,
+    fetch_ltp, fetch_candles, is_market_closed
+)
+from ui_utils import dark_layout, stat_chips_row, market_closed_notice, now_ist, BLUE, GREEN, RED, ORANGE
+
+
+def _get_chain(fyers, index: str, cache: dict):
+    key = f"chain_{index}"
+    if key not in cache:
+        resp = fetch_option_chain(fyers, index)
+        expiries, strikes, chain_map = parse_option_chain(resp, index)
+        cache[key] = {"expiries": expiries, "strikes": strikes}
+    return cache[key]
+
+
+def render(fyers):
+    st.header("✖️ Multiplier Chart — SENSEX / NIFTY Ratio")
+
+    chain_cache = st.session_state.setdefault("chain_cache_t2", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # SENSEX inputs
+    sx_chain = _get_chain(fyers, "SENSEX", chain_cache)
+    sx_expiry = col1.selectbox("SENSEX Expiry", sx_chain.get("expiries", [""]), key="sx_exp_t2")
+    sx_strikes = sx_chain.get("strikes", [79000])
+    sx_default = sx_strikes[len(sx_strikes)//2] if sx_strikes else 79000
+    sx_strike  = col2.selectbox("SENSEX Strike", sx_strikes,
+                                index=sx_strikes.index(sx_default) if sx_default in sx_strikes else 0,
+                                key="sx_str_t2")
+
+    # NIFTY inputs
+    nf_chain = _get_chain(fyers, "NIFTY", chain_cache)
+    nf_expiry = col3.selectbox("NIFTY Expiry", nf_chain.get("expiries", [""]), key="nf_exp_t2")
+    nf_strikes = nf_chain.get("strikes", [24000])
+    nf_default = nf_strikes[len(nf_strikes)//2] if nf_strikes else 24000
+    nf_strike  = col4.selectbox("NIFTY Strike", nf_strikes,
+                                index=nf_strikes.index(nf_default) if nf_default in nf_strikes else 0,
+                                key="nf_str_t2")
+
+    tf = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h"], index=1, key="tf_t2")
+
+    mult_history = st.session_state.setdefault("mult_history", [])
+    live_on = st.session_state.get("mult_live_on", False)
+
+    col_start, col_stop, col_clear = st.columns(3)
+    if col_start.button("▶ Start", disabled=live_on, key="mult_start"):
+        st.session_state["mult_live_on"] = True
+        st.rerun()
+    if col_stop.button("⏹ Stop", key="mult_stop"):
+        st.session_state["mult_live_on"] = False
+    if col_clear.button("🗑 Clear", key="mult_clear"):
+        st.session_state["mult_history"] = []
+        mult_history = []
+
+    def _fetch_mult():
+        """Fetch current multiplier value."""
+        sx_ce_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "CE")
+        sx_pe_sym = build_symbol("SENSEX", sx_expiry, sx_strike, "PE")
+        nf_ce_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "CE")
+        nf_pe_sym = build_symbol("NIFTY",  nf_expiry, nf_strike, "PE")
+
+        all_syms = [sx_ce_sym, sx_pe_sym, nf_ce_sym, nf_pe_sym]
+        ltp_data = fetch_ltp(fyers, all_syms)
+
+        sx_ce = ltp_data.get(sx_ce_sym, {}).get("ltp", 0)
+        sx_pe = ltp_data.get(sx_pe_sym, {}).get("ltp", 0)
+        nf_ce = ltp_data.get(nf_ce_sym, {}).get("ltp", 0)
+        nf_pe = ltp_data.get(nf_pe_sym, {}).get("ltp", 0)
+
+        sx_synth = sx_strike + sx_ce - sx_pe
+        nf_synth = nf_strike + nf_ce - nf_pe
+
+        mult = sx_synth / nf_synth if nf_synth != 0 else 0
+
+        closed = is_market_closed(ltp_data)
+        return mult, sx_synth, nf_synth, closed
+
+    # Snapshot for stat chips
+    if sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            if closed:
+                market_closed_notice()
+
+            hist_vals = [h["mult"] for h in mult_history] if mult_history else [mult]
+            stat_chips_row([
+                ("Current Multiplier", f"{mult:.4f}", "blue"),
+                ("SENSEX Synthetic",   f"₹{sx_synth:,.2f}", "text"),
+                ("NIFTY Synthetic",    f"₹{nf_synth:,.2f}", "text"),
+                ("Session High",  f"{max(hist_vals):.4f}", "green"),
+                ("Session Low",   f"{min(hist_vals):.4f}", "red"),
+            ])
+        except Exception as e:
+            st.error(f"Fetch error: {e}")
+
+    # Chart
+    if mult_history:
+        df = pd.DataFrame(mult_history)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["mult"],
+                                 line=dict(color=BLUE, width=2), name="Multiplier"))
+        # Reference line at 3.25
+        fig.add_hline(y=3.25, line_dash="dot", line_color=ORANGE, annotation_text="3.25×")
+        fig.update_layout(**dark_layout("SENSEX/NIFTY Multiplier", 400))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sub-charts: synthetic prices
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df["ts"], y=df["sx_synth"], name="SENSEX Synth",
+                                  line=dict(color=GREEN)))
+        fig2.update_layout(**dark_layout("SENSEX Synthetic Price", 250))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["ts"], y=df["nf_synth"], name="NIFTY Synth",
+                                  line=dict(color=RED)))
+        fig3.update_layout(**dark_layout("NIFTY Synthetic Price", 250))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # Live tick
+    if st.session_state.get("mult_live_on") and sx_expiry and nf_expiry:
+        try:
+            mult, sx_synth, nf_synth, closed = _fetch_mult()
+            ts = now_ist()
+            st.session_state["mult_history"].append({
+                "ts": ts, "mult": mult,
+                "sx_synth": sx_synth, "nf_synth": nf_synth
+            })
+        except Exception:
+            pass
+        import time; time.sleep(3)
+        st.rerun()
