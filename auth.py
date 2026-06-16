@@ -1,179 +1,177 @@
-import streamlit as st
+"""
+SQLite-based user authentication with per-tab tool access control.
+"""
+
 import sqlite3
 import hashlib
-from datetime import datetime
+import streamlit as st
+from pathlib import Path
 
-DB_PATH = "option_matrix.db"
+DB_PATH = "users.db"
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            username      TEXT UNIQUE NOT NULL,
-            password      TEXT NOT NULL,
-            role          TEXT DEFAULT 'pending',
-            approved_tools TEXT DEFAULT '',
-            subscription  TEXT DEFAULT 'free',
-            created_at    TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    admin_pw = _hash("admin123")
-    c.execute("""
-        INSERT OR IGNORE INTO users (username, password, role, approved_tools)
-        VALUES (?, ?, 'admin', 'spread,multiplier,iv,tracker,backtest,positions')
-    """, ("admin", admin_pw))
-    conn.commit()
-    conn.close()
+ALL_TOOLS = ["spread", "multiplier", "iv", "tracker", "backtest", "positions", "strategy", "bhavcopy", "quiz"]
+
+TOOL_LABELS = {
+    "spread":     "📊 Spread Chart",
+    "multiplier": "✖️ Multiplier Chart",
+    "iv":         "📈 IV Calculator",
+    "tracker":    "🔍 Spread Tracker",
+    "backtest":   "🕐 Historical Backtest",
+    "positions":  "📋 Position Analysis",
+    "strategy":   "🧩 Strategy Builder",
+    "bhavcopy":   "📂 Live Bhavcopy",
+    "quiz":       "🎓 NISM Quiz",
+}
+
 
 def _hash(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
 
-def register_user(username: str, password: str) -> tuple:
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    try:
-        c.execute("INSERT INTO users (username, password) VALUES (?,?)",
-                  (username.strip(), _hash(password)))
-        conn.commit()
-        return True, "Account created! Awaiting admin approval."
-    except sqlite3.IntegrityError:
-        return False, "Username already taken."
-    finally:
-        conn.close()
 
-def login_user(username: str, password: str) -> tuple:
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT username, role, approved_tools FROM users WHERE username=? AND password=?",
-              (username.strip(), _hash(password)))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return False, {}
-    uname, role, tools_str = row
-    if role == "pending":
-        return False, {"pending": True}
-    tools = [t.strip() for t in tools_str.split(",") if t.strip()]
-    return True, {"username": uname, "role": role, "tools": tools}
+def _conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def get_all_users():
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT username, role, approved_tools FROM users ORDER BY username"
-    ).fetchall()
-    conn.close()
-    return rows
 
-def update_user_tools(username: str, tools: list):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET approved_tools=? WHERE username=?",
-              (",".join(tools), username))
-    conn.commit()
-    conn.close()
+def init_db():
+    with _conn() as con:
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password TEXT NOT NULL,
+                role TEXT DEFAULT 'member'
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tool_access (
+                username TEXT,
+                tool TEXT,
+                PRIMARY KEY (username, tool)
+            )
+        """)
+        # Default admin
+        cur.execute("SELECT username FROM users WHERE username='admin'")
+        if not cur.fetchone():
+            cur.execute("INSERT INTO users VALUES (?, ?, ?)", ("admin", _hash("admin123"), "admin"))
+        con.commit()
 
-def update_user_role(username: str, role: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET role=? WHERE username=?", (role, username))
-    conn.commit()
-    conn.close()
+
+def verify_login(username: str, password: str) -> tuple[bool, str]:
+    with _conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT role FROM users WHERE username=? AND password=?",
+                    (username, _hash(password)))
+        row = cur.fetchone()
+        if row:
+            return True, row[0]
+        return False, ""
+
+
+def get_users() -> list[dict]:
+    with _conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT username, role FROM users ORDER BY username")
+        return [{"username": r[0], "role": r[1]} for r in cur.fetchall()]
+
+
+def add_user(username: str, password: str, role: str = "member"):
+    with _conn() as con:
+        con.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?)",
+                    (username, _hash(password), role))
+
 
 def delete_user(username: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE username=?", (username,))
-    conn.commit()
-    conn.close()
+    with _conn() as con:
+        con.execute("DELETE FROM users WHERE username=?", (username,))
+        con.execute("DELETE FROM tool_access WHERE username=?", (username,))
 
-def change_password(username: str, new_password: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET password=? WHERE username=?",
-              (_hash(new_password), username))
-    conn.commit()
-    conn.close()
 
-def upsert_user(username: str, password: str, role: str = "member",
-                approved: bool = True, tools: str = ""):
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    existing = c.execute(
-        "SELECT username FROM users WHERE username=?", (username,)).fetchone()
-    if existing:
-        c.execute("UPDATE users SET role=?,approved_tools=? WHERE username=?",
-                  (role, tools, username))
-    else:
-        c.execute(
-            "INSERT INTO users(username,password,role,approved_tools) VALUES(?,?,?,?)",
-            (username.strip(), _hash(password), role, tools))
-    conn.commit()
-    conn.close()
+def get_user_tools(username: str) -> list[str]:
+    with _conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT tool FROM tool_access WHERE username=?", (username,))
+        return [r[0] for r in cur.fetchall()]
 
-def render_login_page():
-    init_db()
+
+def set_user_tools(username: str, tools: list[str]):
+    with _conn() as con:
+        con.execute("DELETE FROM tool_access WHERE username=?", (username,))
+        for tool in tools:
+            con.execute("INSERT OR IGNORE INTO tool_access VALUES (?, ?)", (username, tool))
+
+
+def has_tool_access(tool: str) -> bool:
+    user = st.session_state.get("username", "")
+    role = st.session_state.get("role", "")
+    if role == "admin":
+        return True
+    return tool in st.session_state.get("user_tools", [])
+
+
+def login_ui():
+    """Render login form. Returns True if logged in."""
+    if st.session_state.get("logged_in"):
+        return True
+
     st.markdown("""
-    <div style="max-width:380px;margin:60px auto 0;padding:0 16px;">
-      <div style="text-align:center;margin-bottom:32px;">
-        <div style="font-size:48px;">⚡</div>
-        <div style="font-size:28px;font-weight:700;color:#d1d4dc;
-                    letter-spacing:0.03em;">Option Matrix</div>
-        <div style="font-size:13px;color:#787b86;margin-top:4px;">
-          Professional Options Analytics</div>
-      </div>
+    <div style='max-width:380px;margin:80px auto 0;'>
+    <h2 style='color:#d1d4dc;text-align:center;margin-bottom:24px;'>🔷 Option Matrix</h2>
     </div>
     """, unsafe_allow_html=True)
 
-    _, center, _ = st.columns([1, 2, 1])
-    with center:
-        tab_login, tab_reg = st.tabs(["Sign In", "Create Account"])
+    with st.form("login_form"):
+        st.subheader("Login")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign In", use_container_width=True)
 
-        with tab_login:
-            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-            username = st.text_input("Username", placeholder="username", key="li_user")
-            password = st.text_input("Password", type="password",
-                                     placeholder="••••••••", key="li_pw")
-            if st.button("Sign In →", use_container_width=True,
-                         type="primary", key="btn_login"):
-                if not username or not password:
-                    st.error("Please fill in all fields.")
-                else:
-                    ok, info = login_user(username, password)
-                    if ok:
-                        st.session_state.logged_in      = True
-                        st.session_state.username       = info["username"]
-                        st.session_state.role           = info["role"]
-                        st.session_state.approved_tools = info["tools"]
-                        st.session_state.page           = "spread"
-                        st.rerun()
-                    elif info.get("pending"):
-                        st.warning("⏳ Your account is pending admin approval.")
-                    else:
-                        st.error("Invalid username or password.")
+    if submitted:
+        ok, role = verify_login(username, password)
+        if ok:
+            st.session_state["logged_in"] = True
+            st.session_state["username"]  = username
+            st.session_state["role"]      = role
+            st.session_state["user_tools"] = get_user_tools(username)
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+    return False
 
-        with tab_reg:
-            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-            r_user = st.text_input("Username", placeholder="choose username",
-                                   key="reg_user")
-            r_pw   = st.text_input("Password", type="password",
-                                   placeholder="min 6 chars", key="reg_pw")
-            r_pw2  = st.text_input("Confirm Password", type="password",
-                                   placeholder="repeat", key="reg_pw2")
-            if st.button("Create Account →", use_container_width=True,
-                         type="primary", key="btn_reg"):
-                if not all([r_user, r_pw, r_pw2]):
-                    st.error("Please fill in all fields.")
-                elif len(r_pw) < 6:
-                    st.error("Password must be at least 6 characters.")
-                elif r_pw != r_pw2:
-                    st.error("Passwords don't match.")
-                else:
-                    ok, msg = register_user(r_user, r_pw)
-                    st.success(f"✅ {msg}") if ok else st.error(msg)
+
+def admin_panel():
+    """Admin user management UI."""
+    st.subheader("👤 User Management")
+    users = get_users()
+
+    # Add user
+    with st.expander("➕ Add New User"):
+        with st.form("add_user_form"):
+            nu = st.text_input("Username")
+            np = st.text_input("Password", type="password")
+            nr = st.selectbox("Role", ["member", "admin"])
+            if st.form_submit_button("Add User"):
+                add_user(nu, np, nr)
+                st.success(f"User '{nu}' added.")
+                st.rerun()
+
+    # Manage existing users
+    for user in users:
+        uname = user["username"]
+        if uname == "admin":
+            continue
+        with st.expander(f"🔧 {uname} ({user['role']})"):
+            current = get_user_tools(uname)
+            selected = st.multiselect(
+                "Tool Access",
+                options=ALL_TOOLS,
+                default=current,
+                format_func=lambda t: TOOL_LABELS.get(t, t),
+                key=f"tools_{uname}",
+            )
+            col1, col2 = st.columns(2)
+            if col1.button("Save Access", key=f"save_{uname}"):
+                set_user_tools(uname, selected)
+                st.success("Saved.")
+            if col2.button("Delete User", key=f"del_{uname}"):
+                delete_user(uname)
+                st.rerun()
