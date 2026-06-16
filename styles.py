@@ -1,44 +1,108 @@
+"""
+Shared UI utilities: theme, stat chips, plotly layout, IST time.
+"""
+
+import plotly.graph_objects as go
+import pandas as pd
 import streamlit as st
 
-def inject_global_css():
+
+# ─────────── THEME ────────────────────────────────────
+BG       = "#131722"
+PANEL    = "#1e222d"
+BORDER   = "#2a2e39"
+TEXT     = "#d1d4dc"
+MUTED    = "#787b86"
+GREEN    = "#26a69a"
+RED      = "#ef5350"
+BLUE     = "#2962ff"
+ORANGE   = "#ff9800"
+PURPLE   = "#9c27b0"
+ROW_BASE = "#162040"
+
+
+def now_ist() -> pd.Timestamp:
+    """Current IST time without timezone info (Streamlit Cloud safe)."""
+    return pd.Timestamp.now(tz="Asia/Kolkata").replace(tzinfo=None)
+
+
+def dark_layout(title: str = "", height: int = 420) -> dict:
+    return dict(
+        paper_bgcolor=BG,
+        plot_bgcolor=PANEL,
+        font=dict(color=TEXT, size=12),
+        title=dict(text=title, font=dict(color=TEXT, size=14)) if title else None,
+        height=height,
+        margin=dict(l=50, r=20, t=40 if title else 20, b=40),
+        xaxis=dict(gridcolor=BORDER, zerolinecolor=BORDER),
+        yaxis=dict(gridcolor=BORDER, zerolinecolor=BORDER),
+        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color=TEXT)),
+    )
+
+
+def apply_dark_css():
+    st.markdown(f"""
+    <style>
+    /* Root dark theme */
+    .stApp {{ background-color: {BG}; color: {TEXT}; }}
+    .stSidebar {{ background-color: {PANEL}; }}
+    .stTabs [data-baseweb="tab-list"] {{ background-color: {PANEL}; border-bottom: 1px solid {BORDER}; }}
+    .stTabs [data-baseweb="tab"] {{ color: {MUTED}; }}
+    .stTabs [aria-selected="true"] {{ color: {TEXT}; border-bottom: 2px solid {BLUE}; }}
+    div[data-testid="metric-container"] {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 6px; padding: 8px 14px; }}
+    .stDataFrame {{ background: {PANEL}; }}
+    .chip-label {{ font-size: 11px; color: {MUTED}; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; }}
+    .chip-value {{ font-size: 22px; font-weight: 700; }}
+    .chip-green {{ color: {GREEN}; }}
+    .chip-red   {{ color: {RED};   }}
+    .chip-blue  {{ color: {BLUE};  }}
+    .chip-orange{{ color: {ORANGE};}}
+    .chip-text  {{ color: {TEXT};  }}
+    .chip-box   {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 6px; padding: 10px 16px; margin: 4px 0; }}
+    .market-closed-banner {{
+        background: #2a1f00; border: 1px solid {ORANGE}; border-radius: 6px;
+        padding: 8px 16px; color: {ORANGE}; font-size: 13px; margin-bottom: 12px;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def stat_chip(label: str, value, color: str = "text"):
+    """Render a single stat chip."""
+    cls = f"chip-{color}"
+    st.markdown(f"""
+    <div class="chip-box">
+      <div class="chip-label">{label}</div>
+      <div class="chip-value {cls}">{value}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def stat_chips_row(chips: list[tuple]):
+    """
+    Render a row of stat chips.
+    chips = list of (label, value, color)
+    """
+    cols = st.columns(len(chips))
+    for col, (label, value, color) in zip(cols, chips):
+        with col:
+            stat_chip(label, value, color)
+
+
+def market_closed_notice():
     st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
-html,body,[class*="css"],.stApp{font-family:'IBM Plex Sans',sans-serif!important;background-color:#131722!important;color:#d1d4dc!important;}
-.main .block-container{background:#131722;padding:1.2rem 1.8rem 2rem;max-width:100%;}
-[data-testid="stSidebar"]{background:#1a1f2e!important;border-right:1px solid #2a2e39!important;}
-[data-testid="stSidebar"] *{color:#d1d4dc!important;}
-[data-testid="stSidebar"] button{background:transparent!important;border:1px solid #2a2e39!important;border-radius:6px!important;font-size:13px!important;text-align:left!important;padding:8px 14px!important;margin-bottom:4px!important;}
-[data-testid="stSidebar"] button[kind="primary"]{background:#162040!important;border-color:#2962ff!important;color:#2962ff!important;}
-[data-testid="stSidebar"] button:hover{background:#2a2e39!important;}
-div[data-baseweb="select"]>div{background:#1e222d!important;border:1px solid #2a2e39!important;border-radius:4px!important;color:#d1d4dc!important;font-size:12px!important;}
-div[data-baseweb="select"] *{color:#d1d4dc!important;font-size:12px!important;}
-div[data-baseweb="popover"]{background:#1e222d!important;border:1px solid #2a2e39!important;}
-li[role="option"]{background:#1e222d!important;}
-li[role="option"]:hover{background:#2a2e39!important;}
-input[type="number"],input[type="text"],input[type="password"]{background:#1e222d!important;border:1px solid #2a2e39!important;border-radius:4px!important;color:#d1d4dc!important;font-size:13px!important;}
-.stButton>button{background:#1e222d!important;color:#d1d4dc!important;border:1px solid #2a2e39!important;border-radius:4px!important;font-size:13px!important;font-weight:500!important;}
-.stButton>button[kind="primary"]{background:#2962ff!important;color:#fff!important;border-color:#2962ff!important;}
-.stButton>button:hover{opacity:0.85!important;}
-div[data-testid="metric-container"]{background:#1e222d;border:1px solid #2a2e39;border-radius:6px;padding:12px 16px;}
-div[data-testid="metric-container"] label{color:#787b86!important;font-size:11px!important;text-transform:uppercase;letter-spacing:0.05em;}
-div[data-testid="metric-container"] div[data-testid="stMetricValue"]{font-family:'JetBrains Mono',monospace;font-size:18px!important;color:#d1d4dc!important;}
-.stTabs [data-baseweb="tab-list"]{background:#1e222d;border-bottom:1px solid #2a2e39;gap:0;border-radius:6px 6px 0 0;}
-.stTabs [data-baseweb="tab"]{background:transparent!important;color:#787b86!important;border-bottom:2px solid transparent!important;font-size:12px!important;padding:9px 18px!important;}
-.stTabs [aria-selected="true"]{color:#2962ff!important;border-bottom-color:#2962ff!important;}
-.stTabs [data-baseweb="tab-panel"]{background:#131722;padding:0;}
-.stDataFrame{background:#1e222d!important;border:1px solid #2a2e39!important;border-radius:6px;}
-thead{background:#1a1f2e!important;}
-th{color:#787b86!important;font-size:11px!important;text-transform:uppercase;}
-td{color:#d1d4dc!important;font-size:12px!important;font-family:'JetBrains Mono',monospace;}
-hr{border-color:#2a2e39!important;margin:12px 0;}
-::-webkit-scrollbar{width:4px;height:4px;}
-::-webkit-scrollbar-track{background:#131722;}
-::-webkit-scrollbar-thumb{background:#2a2e39;border-radius:2px;}
-.sec-header{font-size:11px;font-weight:500;color:#787b86;text-transform:uppercase;letter-spacing:0.07em;padding:6px 0;border-bottom:1px solid #2a2e39;margin-bottom:12px;}
-.stat-chip{background:#1e222d;border:1px solid #2a2e39;border-radius:6px;padding:10px 14px;text-align:center;}
-.stat-chip .sc-label{font-size:10px;color:#787b86;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:4px;}
-.stat-chip .sc-val{font-size:15px;font-weight:500;font-family:'JetBrains Mono',monospace;}
-.stAlert{background:#1e222d!important;border:1px solid #2a2e39!important;color:#d1d4dc!important;}
-</style>
-""", unsafe_allow_html=True)
+    <div class="market-closed-banner">
+    🔴 Market Closed — Showing Previous Close Prices
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def fmt_price(v: float) -> str:
+    if v >= 1000:
+        return f"₹{v:,.2f}"
+    return f"₹{v:.2f}"
+
+
+def fmt_pnl(v: float) -> str:
+    sign = "+" if v > 0 else ""
+    return f"{sign}₹{v:,.0f}"
