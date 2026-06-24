@@ -95,7 +95,8 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
             return None, f"Step 4: no auth_code in response: {r4d}"
 
         # New Fyers API: exchange auth_code via validate-authcode using SHA-256 app hash
-        app_id_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
+        # Fyers requires the FULL client_id (including the "-100" suffix), not just the app_id portion
+        app_id_hash = hashlib.sha256(f"{client_id}:{secret_key}".encode()).hexdigest()
         r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
             "grant_type": "authorization_code",
             "appIdHash": app_id_hash,
