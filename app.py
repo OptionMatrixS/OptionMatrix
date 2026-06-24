@@ -94,9 +94,9 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         if not auth_code:
             return None, f"Step 4: no auth_code in response: {r4d}"
 
-        # New Fyers API: exchange auth_code via validate-authcode using SHA-256 app hash
-        # Fyers requires the FULL client_id (including the "-100" suffix), not just the app_id portion
-        app_id_hash = hashlib.sha256(f"{client_id}:{secret_key}".encode()).hexdigest()
+        # FIX 1: Hash uses NO colon separator — f"{client_id}{secret_key}" not f"{client_id}:{secret_key}"
+        # FIX 2: Removed SDK fallback — auth code is single-use; fallback was consuming it a second time
+        app_id_hash = hashlib.sha256(f"{client_id}{secret_key}".encode()).hexdigest()
         r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
             "grant_type": "authorization_code",
             "appIdHash": app_id_hash,
@@ -105,17 +105,9 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         r5d = r5.json()
         token = r5d.get("access_token")
         if not token:
-            # Fallback: try legacy SDK exchange
-            session = fyersModel.SessionModel(
-                client_id=client_id, secret_key=secret_key,
-                redirect_uri=redirect_uri, response_type="code", grant_type="authorization_code"
-            )
-            session.set_token(auth_code)
-            r5d = session.generate_token()
-            token = r5d.get("access_token")
-        if not token:
             return None, f"Step 5 failed: {r5d}"
         return token, None
+
     except Exception as e:
         return None, f"Exception: {str(e)}"
 
