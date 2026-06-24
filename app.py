@@ -46,103 +46,76 @@ def b64(value):
     return base64.b64encode(str(value).encode()).decode()
 
 def generate_token(client_id, secret_key, username, pin, totp_key):
-    """All credentials passed explicitly — never reads st.secrets inside cached context.
-
-    Flow matches FyersDev reference implementation:
-      Step 1 — send_login_otp_v2   (raw JSON string, not json= kwarg)
-      Step 2 — verify_otp          (TOTP)
-      Step 3 — verify_pin_v2       (PIN)
-      Step 4 — api.fyers.in/api/v2/token  ← v2 endpoint, expects 308 redirect, yields auth_code in Url
-      Step 5 — SDK SessionModel.generate_token()  ← handles appIdHash internally
-    """
+    """All credentials passed explicitly — never reads st.secrets inside cached context."""
     redirect_uri = "http://127.0.0.1:8080/"
-
-    headers = {
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
-    }
 
     try:
         s = requests.Session()
-        s.headers.update(headers)
-
-        # Step 1 — send OTP (send raw string body, not json= kwarg)
-        data1 = f'{{"fy_id":"{b64(username)}","app_id":"2"}}'
         r1 = s.post("https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
-                    data=data1, timeout=10)
+                    json={"fy_id": b64(username), "app_id": "2"}, timeout=10)
         if r1.status_code == 429:
             return None, "Rate limited by Fyers (429). Wait ~60s then click Refresh Token."
         try:
             r1d = r1.json()
         except Exception:
             return None, f"Step 1 bad response (status {r1.status_code}): {r1.text[:200]}"
-        request_key = r1d.get("request_key")
-        if not request_key:
+        if r1d.get("s") != "ok":
             return None, f"Step 1 failed: {r1d}"
 
-        # Step 2 — verify TOTP
         totp_code = pyotp.TOTP(totp_key).now()
-        data2 = f'{{"request_key":"{request_key}","otp":{totp_code}}}'
         r2 = s.post("https://api-t2.fyers.in/vagator/v2/verify_otp",
-                    data=data2, timeout=10)
+                    json={"request_key": r1d["request_key"], "otp": totp_code}, timeout=10)
         r2d = r2.json()
-        request_key2 = r2d.get("request_key")
-        if r2.status_code != 200 or not request_key2:
+        if r2d.get("s") != "ok":
             return None, f"Step 2 failed: {r2d}"
 
-        # Step 3 — verify PIN
-        data3 = f'{{"request_key":"{request_key2}","identity_type":"pin","identifier":"{b64(pin)}"}}'
         r3 = s.post("https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
-                    data=data3, timeout=10)
+                    json={"request_key": r2d["request_key"], "identity_type": "pin", "identifier": b64(pin)}, timeout=10)
         r3d = r3.json()
-        bearer = (r3d.get("data") or {}).get("access_token")
-        if r3.status_code != 200 or not bearer:
+        if r3d.get("s") != "ok":
             return None, f"Step 3 failed: {r3d}"
 
-        # Step 4 — get auth_code  ← use api.fyers.in/api/v2/token (NOT api-t1/v3/token)
-        #           Fyers returns 308 redirect; auth_code is in the Url field
-        app_id_short = client_id.split("-")[0]   # strip "-100"
-        data4 = (
-            f'{{"fyers_id":"{username}","app_id":"{app_id_short}",'
-            f'"redirect_uri":"{redirect_uri}","appType":"100",'
-            f'"code_challenge":"","state":"abcdefg","scope":"",'
-            f'"nonce":"","response_type":"code","create_cookie":true}}'
-        )
-        r4 = s.post(
-            "https://api.fyers.in/api/v2/token",
-            headers={"authorization": f"Bearer {bearer}",
-                     "content-type": "application/json; charset=UTF-8"},
-            data=data4,
-            allow_redirects=False,
-            timeout=10,
-        )
+        app_id = client_id.split("-")[0]
+        r4 = s.post("https://api-t1.fyers.in/api/v3/token", json={
+            "fyers_id": username, "app_id": app_id, "redirect_uri": redirect_uri,
+            "appType": "100", "code_challenge": "", "state": "sample",
+            "scope": "", "nonce": "", "response_type": "code", "create_cookie": True
+        }, headers={"Authorization": f"Bearer {r3d['data']['access_token']}"}, timeout=10)
         r4d = r4.json()
-        url_with_code = r4d.get("Url") or r4d.get("url") or ""
-        auth_code = parse_qs(urlparse(url_with_code).query).get("auth_code", [None])[0]
-        if not auth_code:
-            # Some SDK versions return auth directly under data
-            auth_code = (r4d.get("data") or {}).get("auth_code")
-        if not auth_code:
-            return None, f"Step 4 failed (status {r4.status_code}): {r4d}"
+        if r4d.get("s") != "ok":
+            return None, f"Step 4 failed: {r4d}"
 
-        # Step 5 — exchange auth_code for access_token via official SDK
-        #           SDK computes appIdHash = SHA256(client_id:secret_key) internally
-        session = fyersModel.SessionModel(
-            client_id=client_id,
-            secret_key=secret_key,
-            redirect_uri=redirect_uri,
-            response_type="code",
-            grant_type="authorization_code",
+        data = r4d.get("data", {})
+        auth_code = (
+            data.get("auth")
+            or parse_qs(urlparse(r4d.get("Url", "")).query).get("auth_code", [None])[0]
+            or parse_qs(urlparse(data.get("url", "")).query).get("auth_code", [None])[0]
         )
-        session.set_token(auth_code)
-        r5d = session.generate_token()
+        if not auth_code:
+            return None, f"Step 4: no auth_code in response: {r4d}"
+
+        # New Fyers API: exchange auth_code via validate-authcode using SHA-256 app hash
+        # Fyers requires the FULL client_id (including the "-100" suffix), not just the app_id portion
+        app_id_hash = hashlib.sha256(f"{client_id}:{secret_key}".encode()).hexdigest()
+        r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
+            "grant_type": "authorization_code",
+            "appIdHash": app_id_hash,
+            "code": auth_code,
+        }, timeout=10)
+        r5d = r5.json()
         token = r5d.get("access_token")
+        if not token:
+            # Fallback: try legacy SDK exchange
+            session = fyersModel.SessionModel(
+                client_id=client_id, secret_key=secret_key,
+                redirect_uri=redirect_uri, response_type="code", grant_type="authorization_code"
+            )
+            session.set_token(auth_code)
+            r5d = session.generate_token()
+            token = r5d.get("access_token")
         if not token:
             return None, f"Step 5 failed: {r5d}"
         return token, None
-
     except Exception as e:
         return None, f"Exception: {str(e)}"
 
