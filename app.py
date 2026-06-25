@@ -13,7 +13,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import time
 from datetime import date
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, unquote
+import re
 from plotly.subplots import make_subplots
 import numpy as np
 from scipy.stats import norm
@@ -86,16 +87,30 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
             return None, f"Step 4 failed: {r4d}"
 
         data = r4d.get("data", {})
+
+        def _extract_auth_code(url_str):
+            """Pull auth_code out of a redirect URL WITHOUT mangling '+' into spaces.
+            parse_qs() does form-encoding-style unescaping, which corrupts base64
+            tokens that legitimately contain '+'. We extract the raw substring and
+            only unquote %XX sequences, leaving '+' untouched."""
+            if not url_str:
+                return None
+            m = re.search(r'auth_code=([^&]+)', url_str)
+            if not m:
+                return None
+            return unquote(m.group(1))  # unquote, NOT unquote_plus — preserves literal '+'
+
         auth_code = (
             data.get("auth")
-            or parse_qs(urlparse(r4d.get("Url", "")).query).get("auth_code", [None])[0]
-            or parse_qs(urlparse(data.get("url", "")).query).get("auth_code", [None])[0]
+            or _extract_auth_code(r4d.get("Url", ""))
+            or _extract_auth_code(data.get("url", ""))
         )
         if not auth_code:
             return None, f"Step 4: no auth_code in response: {r4d}"
 
         # New Fyers API: exchange auth_code via validate-authcode using SHA-256 app hash
-        app_id_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
+        # Fyers requires the FULL client_id (including the "-100" suffix), not just the app_id portion
+        app_id_hash = hashlib.sha256(f"{client_id}:{secret_key}".encode()).hexdigest()
         r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
             "grant_type": "authorization_code",
             "appIdHash": app_id_hash,
@@ -113,7 +128,11 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
             r5d = session.generate_token()
             token = r5d.get("access_token")
         if not token:
-            return None, f"Step 5 failed: {r5d}"
+            debug_info = (
+                f" [debug: code_len={len(auth_code)}, code_preview={auth_code[:6]}...{auth_code[-6:]}, "
+                f"hash_prefix={app_id_hash[:10]}..., client_id={client_id}]"
+            )
+            return None, f"Step 5 failed: {r5d}{debug_info}"
         return token, None
     except Exception as e:
         return None, f"Exception: {str(e)}"
@@ -189,16 +208,6 @@ _UNDERLYING_SYM = {
     "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
     "FINNIFTY":  "NSE:FINNIFTY-INDEX",
     "MIDCPNIFTY":"NSE:MIDCPNIFTY-INDEX",
-    # MCX commodities — option chain symbol format (big contracts)
-    "CRUDEOIL":  "MCX:CRUDEOIL-INDEX",
-    "GOLD":      "MCX:GOLD-INDEX",
-    "SILVER":    "MCX:SILVER-INDEX",
-    "NATURALGAS":"MCX:NATURALGAS-INDEX",
-    # MCX mini contracts — same -INDEX symbology format
-    "CRUDEOILM":  "MCX:CRUDEOILM-INDEX",
-    "GOLDM":      "MCX:GOLDM-INDEX",
-    "SILVERM":    "MCX:SILVERM-INDEX",
-    "NATURALGASM":"MCX:NATURALGASM-INDEX",
 }
 
 _MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
@@ -228,11 +237,7 @@ def _save_expiry_cache(expiries: dict):
 
 @st.cache_resource
 def _fetch_expiries_from_fyers(client_id, token, fyers_sym):
-    """Hits Fyers option chain API. Returns (dict, error_str).
-
-    Honors API's `expiry_flag` field ('M' = monthly, 'W' = weekly) when present;
-    falls back to last-day-of-month inference if the flag is missing.
-    """
+    """Hits Fyers option chain API. Returns (dict, error_str)."""
     from collections import defaultdict
     try:
         fyers = fyersModel.FyersModel(client_id=client_id, token=token, log_path="")
@@ -245,7 +250,6 @@ def _fetch_expiries_from_fyers(client_id, token, fyers_sym):
         for entry in raw:
             if not isinstance(entry, dict): continue
             d = entry.get("date", "")
-            flag = (entry.get("expiry_flag") or "").upper()
             try:
                 dd, mm, yyyy = d.split("-")
                 dd, mm, yyyy = int(dd), int(mm), int(yyyy)
@@ -253,21 +257,16 @@ def _fetch_expiries_from_fyers(client_id, token, fyers_sym):
                 continue
             yy  = yyyy % 100
             mon = _MONTHS[mm - 1]
-            parsed.append((yy, mm, dd, mon, flag))
+            parsed.append((yy, mm, dd, mon))
 
         by_month = defaultdict(list)
-        for yy, mm, dd, mon, _flag in parsed:
+        for yy, mm, dd, mon in parsed:
             by_month[(yy, mm)].append(dd)
         last_of_month = {k: max(v) for k, v in by_month.items()}
 
         result = {}
-        for yy, mm, dd, mon, flag in parsed:
-            if flag == "M":
-                is_monthly = True
-            elif flag == "W":
-                is_monthly = False
-            else:
-                is_monthly = (dd == last_of_month[(yy, mm)])
+        for yy, mm, dd, mon in parsed:
+            is_monthly = (dd == last_of_month[(yy, mm)])
             if is_monthly:
                 code  = f"{yy:02d}{mon}"
                 label = f"{dd:02d} {mon} {yy:02d} (M)"
@@ -278,42 +277,6 @@ def _fetch_expiries_from_fyers(client_id, token, fyers_sym):
         return result, None
     except Exception as e:
         return {}, str(e)
-
-@st.cache_resource(ttl=24*3600)
-def _fetch_mcx_expiries_from_symmaster(commodity):
-    """Fallback for MCX: enumerate monthly option expiries from the public symbol master JSON.
-
-    Per Fyers docs (https://public.fyers.in/sym_details/MCX_COM_sym_master.json),
-    each key is a tradable symbol like `MCX:CRUDEOIL25DEC5500CE`. We parse out the
-    {YY}{MMM} substring between the commodity name and the strike/CE/PE suffix.
-    MCX commodity options are monthly only.
-    """
-    import re, urllib.request, json as _json
-    url = "https://public.fyers.in/sym_details/MCX_COM_sym_master.json"
-    try:
-        with urllib.request.urlopen(url, timeout=10) as r:
-            data = _json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        return {}, f"symbol-master fetch failed: {e}"
-
-    pat = re.compile(rf"^MCX:{re.escape(commodity.upper())}(\d{{2}})({'|'.join(_MONTHS)})\d+(?:CE|PE)$")
-    found = set()
-    for key in data.keys():
-        m = pat.match(str(key).upper())
-        if m:
-            found.add((int(m.group(1)), m.group(2)))
-
-    if not found:
-        return {}, f"no MCX:{commodity} option symbols found in MCX_COM_sym_master.json"
-
-    sortable = sorted(found, key=lambda t: (t[0], _MONTHS.index(t[1])))
-    result = {}
-    for yy, mon in sortable:
-        code  = f"{yy:02d}{mon}"
-        label = f"-- {mon} {yy:02d} (M)"
-        result[label] = code
-    return result, None
-
 
 def get_expiries_for(exchange, underlying):
     """Returns expiry dict — served from daily file cache; hits Fyers only once per day."""
@@ -331,17 +294,6 @@ def get_expiries_for(exchange, underlying):
             return {}
         cid = get_secret("FYERS_CLIENT_ID") or CLIENT_ID
         result, err = _fetch_expiries_from_fyers(cid, token, sym)
-
-        # 3. MCX fallback — option-chain API often returns nothing for commodities.
-        # Use the public MCX symbol master file as the authoritative source.
-        if not result and exchange.upper() == "MCX":
-            result2, err2 = _fetch_mcx_expiries_from_symmaster(underlying)
-            if result2:
-                result = result2
-                err = None  # success via fallback
-            else:
-                err = f"{err}; fallback: {err2}"
-
         if result:
             cached[sym] = result
             _save_expiry_cache(cached)
@@ -831,16 +783,12 @@ if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame()
 if "df_custom" not in st.session_state:
     st.session_state.df_custom = pd.DataFrame()
-if "df_bfly8" not in st.session_state:
-    st.session_state.df_bfly8 = pd.DataFrame()
-if "df_mcx" not in st.session_state:
-    st.session_state.df_mcx = pd.DataFrame()
 
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Spread Dashboard", "🧮 Butterfly", "📐 IV Analysis","🦋 Butterfly Straddle", "🔶 MCX Spread"])
+tab1, tab2, tab3 = st.tabs(["📊 Spread Dashboard", "🧮 Butterfly", "📐 IV Analysis"])
 
 # ─────────────────────────────────────────────
 # TAB 2 — CUSTOM 4-LEG BUILDER
@@ -953,8 +901,8 @@ with tab2:
                 spread34 = s[2] - s[3]
                 combined = spread12 + spread34
                 st.session_state.df_custom = pd.DataFrame({
-                    "line1": spread12,
-                    "line2": spread34,
+                    "spread12": spread12,
+                    "spread34": spread34,
                     "combined": combined,
                 })
 
@@ -978,13 +926,13 @@ with tab2:
         <div class="metrics-grid">
             <div class="metric-card card-ce">
                 <div class="metric-badge">📊</div>
-                <div class="metric-label">LEG1−LEG2+LEG3−LEG4</div>
+                <div class="metric-label">LEG 1 − LEG 2</div>
                 <div class="metric-value val-ce">{_s12:+.1f}</div>
                 <div class="metric-sub">Spread &nbsp; {_darrow(_s12_d)}</div>
             </div>
             <div class="metric-card card-pe">
                 <div class="metric-badge">📊</div>
-                <div class="metric-label">LEG5−LEG6+LEG7−LEG8</div>
+                <div class="metric-label">LEG 3 − LEG 4</div>
                 <div class="metric-value val-pe">{_s34:+.1f}</div>
                 <div class="metric-sub">Spread &nbsp; {_darrow(_s34_d)}</div>
             </div>
@@ -1032,10 +980,10 @@ with tab2:
 
         fig1 = go.Figure()
         fig1.add_trace(go.Scatter(x=df_custom.index, y=df_custom["spread12"],
-            name="Leg1−Leg2+Leg3−Leg4", line=dict(color="red", width=2),
+            name="Leg1 − Leg2", line=dict(color="#f87171", width=2),
             hovertemplate="%{x|%H:%M}<br>Leg1−Leg2: %{y:.2f}<extra></extra>"))
         fig1.add_trace(go.Scatter(x=df_custom.index, y=df_custom["spread34"],
-            name="Leg5−Leg6+Leg7−Leg8", line=dict(color="green", width=2),
+            name="Leg3 − Leg4", line=dict(color="#60a5fa", width=2),
             hovertemplate="%{x|%H:%M}<br>Leg3−Leg4: %{y:.2f}<extra></extra>"))
         make_hlines(fig1, df_custom["spread12"], ["#f87171", "#f87171"])
         chart_layout(fig1, "Spread Chart — Leg1−Leg2  &  Leg3−Leg4")
@@ -1052,218 +1000,6 @@ with tab2:
         st.plotly_chart(fig2, use_container_width=True)
     else:
         st.info("👆 Configure your 4 legs above and click **Fetch 4-Leg Data**.")
-
-with tab4:
-    st.markdown("<div style='font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#64748b;margin-bottom:8px;'>Configure 8 Legs</div>", unsafe_allow_html=True)
-
-    UNDERLYINGS = ["SENSEX", "BANKEX", "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
-    leg_colors  = ["#f87171","#34d399","#60a5fa","#fbbf24","#f472b6","#22d3ee","#a78bfa","#fb923c"]
-    leg_labels  = ["Leg 1","Leg 2","Leg 3","Leg 4","Leg 5","Leg 6","Leg 7","Leg 8"]
-    leg_configs = []
-
-    # ── Next Tuesday (NSE) and next Thursday (BSE) expiry ──
-    def next_weekday_str(weekday):
-        d = date.today()
-        days_ahead = weekday - d.weekday()
-        if days_ahead <= 0:
-            days_ahead += 7
-        return (d + pd.Timedelta(days=days_ahead)).strftime("%y%m%d")
-
-    nse_exp = next_weekday_str(1)  # Tuesday
-    bse_exp = next_weekday_str(3)  # Thursday
-
-    LEG_DEFAULTS = [
-        ("BSE", "SENSEX",  nse_exp, 80000, "CE", 1.0),
-        ("NSE", "NIFTY", bse_exp, 24200, "CE", 3.3),
-        ("BSE", "SENSEX", bse_exp, 80000, "CE", 1.0),
-        ("NSE", "NIFTY",  nse_exp, 24200, "CE", 3.3),
-        ("BSE", "SENSEX",  nse_exp, 80000, "CE", 1.0),
-        ("NSE", "NIFTY", bse_exp, 24200, "CE", 3.3),
-        ("BSE", "SENSEX", bse_exp, 80000, "CE", 1.0),
-        ("NSE", "NIFTY",  nse_exp, 24200, "CE", 3.3),
-    ]
-
-    if "b8_defaults_set" not in st.session_state:
-        for i, (ex, un, ep, st_, ot, mu) in enumerate(LEG_DEFAULTS):
-            st.session_state[f"b8_exch_{i}"]  = ex
-            st.session_state[f"b8_under_{i}"] = un
-            st.session_state[f"b8_exp_{i}"]   = ep
-            st.session_state[f"b8_str_{i}"]   = float(st_)
-            st.session_state[f"b8_opt_{i}"]   = ot
-            st.session_state[f"b8_lots_{i}"]  = mu
-        st.session_state["b8_defaults_set"] = True
-
-    b8_row = st.columns([1.2, 1, 1, 1, 1.5])
-    with b8_row[0]: custom_date     = st.date_input("Date",       value=default_date,           key="b8_date")
-    with b8_row[1]: custom_interval = st.selectbox("Interval",    [1,3,5,10,15,30,60], index=2, key="b8_interval")
-    with b8_row[2]: b8_auto          = st.checkbox("Auto Refresh", value=False,                  key="b8_auto_refresh")
-    with b8_row[3]: b8_secs          = st.slider("Sec", 5, 60, 10,                               key="b8_refresh_secs")
-    with b8_row[4]: custom_fetch    = st.button("⟳  FETCH 4-LEG DATA", type="primary", use_container_width=True, key="b8_fetch")
-
-    # All 4 legs on 2 rows (2 legs per row), same style as Tab 1
-    for row_idx in range(4):
-        legs_in_row = [row_idx * 2, row_idx * 2 + 1]
-        cols = st.columns([0.25, 0.5, 0.8, 0.8, 0.65, 0.65, 0.6, 0.15,
-                           0.25, 0.5, 0.8, 0.8, 0.65, 0.65, 0.6])
-        for j, i in enumerate(legs_in_row):
-            d_exch, d_under, d_exp, d_str, d_opt, d_mult = LEG_DEFAULTS[i]
-            exch_opts = ["NSE","BSE"] if d_exch == "NSE" else ["BSE","NSE"]
-            und_opts  = [d_under] + [u for u in UNDERLYINGS if u != d_under]
-            off = j * 8  # column offset for second leg
-            cols[off].markdown(f"<div style='padding-top:28px;font-size:10px;font-weight:700;color:{leg_colors[i]};'>{leg_labels[i].upper()}</div>", unsafe_allow_html=True)
-            with cols[off+1]: exch  = st.selectbox("Exchange",   exch_opts, key=f"b8_exch_{i}")
-            with cols[off+2]: under = st.selectbox("Underlying", und_opts,  key=f"b8_under_{i}")
-            _exp_opts = get_expiries_for(exch, under)
-            with cols[off+3]: expiry   = expiry_selectbox("Expiry", _exp_opts, f"b8_exp_man_{i}", f"b8_exp_sel_{i}", d_exp)
-            with cols[off+4]: strike   = st.number_input("Strike",   step=100,              key=f"b8_str_{i}")
-            with cols[off+5]: opt_type = st.selectbox("CE/PE",      ["CE","PE"],            key=f"b8_opt_{i}")
-            with cols[off+6]: mult     = st.number_input("Mult",     min_value=0.1, step=0.1, key=f"b8_lots_{i}")
-            if j == 0:
-                cols[7].markdown("<div style='padding-top:28px;font-size:10px;color:#e2e8f0;text-align:center;'>│</div>", unsafe_allow_html=True)
-            leg_configs.append({"exchange": exch, "underlying": under, "expiry": expiry,
-                                "strike": int(strike), "opt_type": opt_type, "lots": mult})
-
-    
-
-    custom_date_str = custom_date.strftime("%Y-%m-%d")
-
-    L = leg_configs
-    def leg_name(i): return f"{L[i]['lots']}×{L[i]['underlying']} {L[i]['opt_type']}"
-    st.markdown(f"""
-    <div style='font-size:11px;color:#64748b;margin:4px 0 8px 0;font-family:monospace;'>
-        Chart 1: &nbsp;<span style='color:#f87171'>{leg_name(0)}</span> − <span style='color:#34d399'>{leg_name(1)}</span>
-        &nbsp;&nbsp;|&nbsp;&nbsp;
-        <span style='color:#60a5fa'>{leg_name(2)}</span> − <span style='color:#fbbf24'>{leg_name(3)}</span>
-        &nbsp;&nbsp;&nbsp;&nbsp;
-        Chart 2: &nbsp;(Leg1−Leg2) + (Leg3−Leg4)
-    </div>
-    """, unsafe_allow_html=True)
-
-    if custom_fetch:
-        fyers = get_fyers_client()
-        if fyers is None:
-            st.error("Not connected to Fyers.")
-        else:
-            raw_series = []
-            ok = True
-            with st.spinner("Fetching 8-leg data..."):
-                for i, leg in enumerate(leg_configs):
-                    sym = build_symbol(leg["exchange"], leg["underlying"], leg["expiry"], leg["opt_type"][0], leg["strike"])
-                    df_leg = fetch_candles(fyers, sym, custom_interval, custom_date_str)
-                    if df_leg.empty:
-                        st.warning(f"⚠️ {leg_labels[i]}: No data for `{sym}`")
-                        ok = False
-                        break
-                    df_leg = df_leg[~df_leg.index.duplicated(keep="last")]
-                    raw_series.append(df_leg["close"] * leg["lots"])
-
-            if ok and len(raw_series) == 8:
-                base_idx = raw_series[0].index
-                s = [sr.reindex(base_idx, method="ffill").fillna(0) for sr in raw_series]
-                spread12 = (s[0]-s[1]) + (s[2]-s[3])
-                spread34 = (s[4]-s[5]) + (s[6]-s[7])
-                combined = spread12 + spread34
-                st.session_state.df_bfly8 = pd.DataFrame({
-                    "line1": spread12,
-                    "line2": spread34,
-                    "combined": combined,
-                })
-
-    df_bfly8 = st.session_state.df_bfly8
-
-    if not df_bfly8.empty:
-        _s12  = df_bfly8['line1'].iloc[-1]
-        _s34  = df_bfly8['line2'].iloc[-1]
-        _comb = df_bfly8['combined'].iloc[-1]
-        _s12_d  = _s12  - df_bfly8['line1'].iloc[-2] if len(df_bfly8) > 1 else 0
-        _s34_d  = _s34  - df_bfly8['line2'].iloc[-2] if len(df_bfly8) > 1 else 0
-        _comb_d = _comb - df_bfly8['combined'].iloc[-2] if len(df_bfly8) > 1 else 0
-        _updated = df_bfly8.index[-1].strftime("%H:%M:%S")
-
-        def _darrow(v):
-            arrow = "▲" if v >= 0 else "▼"
-            color = "#f87171" if v >= 0 else "#34d399"
-            return f"<span style='color:{color};font-size:11px;'>{arrow} {abs(v):.2f}</span>"
-
-        st.markdown(f"""
-        <div class="metrics-grid">
-            <div class="metric-card card-ce">
-                <div class="metric-badge">📊</div>
-                <div class="metric-label">LEG1−LEG2+LEG3−LEG4</div>
-                <div class="metric-value val-ce">{_s12:+.1f}</div>
-                <div class="metric-sub">Spread &nbsp; {_darrow(_s12_d)}</div>
-            </div>
-            <div class="metric-card card-pe">
-                <div class="metric-badge">📊</div>
-                <div class="metric-label">LEG5−LEG6+LEG7−LEG8</div>
-                <div class="metric-value val-pe">{_s34:+.1f}</div>
-                <div class="metric-sub">Spread &nbsp; {_darrow(_s34_d)}</div>
-            </div>
-            <div class="metric-card card-diff">
-                <div class="metric-badge">⚖️</div>
-                <div class="metric-label">4 LEG TOTAL</div>
-                <div class="metric-value val-diff">{_comb:+.1f}</div>
-                <div class="metric-sub">(Leg1−Leg2) + (Leg3−Leg4) &nbsp; {_darrow(_comb_d)}</div>
-            </div>
-            <div class="metric-card card-time">
-                <div class="metric-badge">🕐</div>
-                <div class="metric-label">LAST UPDATE</div>
-                <div class="metric-value val-time">{_updated}</div>
-                <div class="metric-sub">{len(df_bfly8)} candles</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        def make_hlines(fig, series, colors):
-            h, l = series.max(), series.min()
-            fig.add_hline(y=0, line_dash="dash", line_color="#444")
-            fig.add_hline(y=h, line_dash="dot", line_color=colors[0], line_width=1,
-                annotation_text=f"H: {h:.0f}", annotation_position="right",
-                annotation_font=dict(color=colors[0], size=10))
-            fig.add_hline(y=l, line_dash="dot", line_color=colors[1], line_width=1,
-                annotation_text=f"L: {l:.0f}", annotation_position="right",
-                annotation_font=dict(color=colors[1], size=10))
-
-        def chart_layout(fig, title, height=380):
-            fig.update_layout(
-                title=dict(text=title, font=dict(size=12, color=T["text2"]), x=0),
-                height=height,
-                plot_bgcolor=T["plot_bg"], paper_bgcolor=T["plot_bg"],
-                font=dict(color=T["text2"]),
-                hovermode="x unified",
-                margin=dict(l=10, r=10, t=40, b=10),
-                legend=dict(bgcolor=T["card"], bordercolor=T["card_bdr"], borderwidth=1,
-                    orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                xaxis=dict(gridcolor=T["grid"], tickfont=dict(size=10),
-                    showspikes=True, spikemode="across", spikecolor=T["text3"], spikethickness=1, spikedash="dot"),
-                yaxis=dict(gridcolor=T["grid"], title="Value (₹)", tickfont=dict(size=10),
-                    showspikes=True, spikemode="across", spikecolor=T["text3"], spikethickness=1, spikedash="dot"),
-                hoverlabel=dict(bgcolor=T["card"], bordercolor=T["card_bdr"], font=dict(color=T["text"])),
-            )
-
-        fig1 = go.Figure()
-        fig1.add_trace(go.Scatter(x=df_bfly8.index, y=df_bfly8["line1"],
-            name="Leg1−Leg2+Leg3−Leg4", line=dict(color="red", width=2),
-            hovertemplate="%{x|%H:%M}<br>Leg1−Leg2: %{y:.2f}<extra></extra>"))
-        fig1.add_trace(go.Scatter(x=df_bfly8.index, y=df_bfly8["line2"],
-            name="Leg5−Leg6+Leg7−Leg8", line=dict(color="green", width=2),
-            hovertemplate="%{x|%H:%M}<br>Leg3−Leg4: %{y:.2f}<extra></extra>"))
-        make_hlines(fig1, df_bfly8["line1"], ["#f87171", "#f87171"])
-        chart_layout(fig1, "Spread Chart — Line1 vs Line2")
-        st.plotly_chart(fig1, use_container_width=True)
-
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=df_bfly8.index, y=df_bfly8["combined"],
-            name="Combined (Leg1−Leg2) + (Leg3−Leg4)",
-            line=dict(color="#818cf8", width=2.5),
-            fill="tozeroy", fillcolor="rgba(129,140,248,0.08)",
-            hovertemplate="%{x|%H:%M}<br>Combined: %{y:.2f}<extra></extra>"))
-        make_hlines(fig2, df_bfly8["combined"], ["#34d399", "#f87171"])
-        chart_layout(fig2, "Combined Chart — (Leg1−Leg2) + (Leg3−Leg4)")
-        st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("👆 Configure your 4 legs above and click **Fetch 8-Leg Data**.")
-
 
 # ─────────────────────────────────────────────
 # TAB 1 — SPREAD DASHBOARD
@@ -1800,7 +1536,7 @@ with tab3:
                 ce_diff = ce_sx.reindex(common_ce) - ce_nf.reindex(common_ce)
                 fig.add_trace(go.Scatter(x=ce_diff.index, y=ce_diff.values,
                     name=f"CE Diff (last: {ce_diff.iloc[-1]:.1f}%)",
-                    line=dict(color="red", width=2),
+                    line=dict(color="#f87171", width=2),
                     hovertemplate="CE Diff: %{y:.2f}%<extra></extra>"))
             # PE diff
             common_pe = pe_sx.index.intersection(pe_nf.index)
@@ -1808,7 +1544,7 @@ with tab3:
                 pe_diff = pe_sx.reindex(common_pe) - pe_nf.reindex(common_pe)
                 fig.add_trace(go.Scatter(x=pe_diff.index, y=pe_diff.values,
                     name=f"PE Diff (last: {pe_diff.iloc[-1]:.1f}%)",
-                    line=dict(color="green", width=2),
+                    line=dict(color="#60a5fa", width=2),
                     hovertemplate="PE Diff: %{y:.2f}%<extra></extra>"))
             fig.add_hline(y=0, line_dash="dash", line_color="#94a3b8", line_width=1)
             fig.update_layout(
@@ -1829,518 +1565,19 @@ with tab3:
         st.markdown("<div style='font-size:12px;font-weight:700;color:#64748b;margin:16px 0 6px 0;'>📊 IV Differential — Sensex IV − Nifty IV (ATM)</div>", unsafe_allow_html=True)
         st.plotly_chart(diff_chart("sx_lo_CE","nf_lo_CE","sx_lo_PE","nf_lo_PE", "Sensex CE IV − Nifty CE IV  &  Sensex PE IV − Nifty PE IV"), use_container_width=True)
 
-        # ── Auto Refresh — DEFERRED (was halting Tab 5 from rendering) ──
+        # ── Auto Refresh ──
         if iv_auto and iv_date_str == date.today().strftime("%Y-%m-%d"):
+            time.sleep(iv_ref_secs)
             st.session_state["_iv_rerun"] = True
-            st.session_state["_iv_rerun_pending"] = True
+            st.rerun()
 
     else:
         st.info("👆 Set expiry dates above and click **Fetch IV Data**.")
 
-# AUTO REFRESH — DEFERRED
+# AUTO REFRESH
 # ─────────────────────────────────────────────
-# Previously this block called st.rerun() inline. That halted script execution
-# BEFORE `with tab5:` (below) could render, leaving Tab 5 permanently blank
-# once Tab 1 had fetched data with Auto Refresh on. Now we just flag it and
-# perform the rerun at the very END of the script.
 
 if auto_refresh and date_str == date.today().strftime("%Y-%m-%d") and not df.empty:
-    st.session_state["_main_rerun_pending"] = True
-
-
-# ─────────────────────────────────────────────
-# TAB 5 — MCX SPREAD
-
-# ─────────────────────────────────────────────
-# TAB 5 — MCX SPREAD DASHBOARD
-# ─────────────────────────────────────────────
-
-MCX_UNDERLYINGS_BIG  = ["SILVER", "GOLD", "CRUDEOIL", "NATURALGAS"]
-MCX_UNDERLYINGS_MINI = ["SILVERM", "GOLDM", "CRUDEOILM", "NATURALGASM"]
-MCX_UNDERLYINGS_ALL  = MCX_UNDERLYINGS_BIG + MCX_UNDERLYINGS_MINI
-
-# Big-contract → mini-contract pairing for the auto-pair toggle.
-MCX_BIG_TO_MINI = {
-    "SILVER":     "SILVERM",
-    "GOLD":       "GOLDM",
-    "CRUDEOIL":   "CRUDEOILM",
-    "NATURALGAS": "NATURALGASM",
-}
-
-# Typical strike & step per MCX commodity — used to seed the strike inputs sensibly.
-# Big & mini share the same underlying price, so strike defaults are identical.
-MCX_STRIKE_DEFAULTS = {
-    "SILVER":      (90000, 250),
-    "SILVERM":     (90000, 250),
-    "GOLD":        (75000, 100),
-    "GOLDM":       (75000, 100),
-    "CRUDEOIL":    (5500,  50),
-    "CRUDEOILM":   (5500,  50),
-    "NATURALGAS":  (300,   5),
-    "NATURALGASM": (300,   5),
-}
-
-with tab5:
-    # ── PROOF-OF-LIFE BANNER ─────────────────────────────────────────────
-    # If you see this banner, the Tab 5 code block IS running.
-    # If you do NOT see this banner, the whole tab is failing to render
-    # (Streamlit error, indentation issue, or you're looking at the wrong tab).
-    import datetime as _dt
-    st.markdown(
-        f"<div style='background:#fef3c7;border:2px solid #f59e0b;"
-        f"padding:8px 12px;border-radius:6px;margin:0 0 10px 0;"
-        f"font-family:monospace;font-size:12px;color:#92400e;'>"
-        f"✅ <b>TAB 5 IS RENDERING</b> &nbsp;·&nbsp; "
-        f"rerun at {_dt.datetime.now().strftime('%H:%M:%S')} "
-        f"·&nbsp; if you see this, the code block is alive."
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    # ── Diagnostic log: must come FIRST so it survives any later exception ──
-    _mcx_logs = []
-    def _mcxlog(msg):
-        line = str(msg)
-        _mcx_logs.append(line)
-        try:
-            print(f"[MCX] {line}", flush=True)
-        except Exception:
-            pass
-
-    _mcxlog(f"── tab5 render start · today={date.today().isoformat()} ──")
-
-    # Collapsible diagnostic log — closed by default. Click to expand.
-    # Lives inside an st.empty() so we can rewrite the whole expander on every
-    # _refresh_log_top() call as more entries accumulate.
-    _mcx_log_slot = st.empty()
-    with _mcx_log_slot.container():
-        with st.expander("🪵 MCX Diagnostic Log", expanded=False):
-            st.code("(MCX log — will update as the tab renders)", language="text")
-
-    st.markdown(
-        "<div style='font-size:10px;font-weight:700;letter-spacing:1.5px;"
-        "text-transform:uppercase;color:#64748b;margin-bottom:4px;'>⚙ MCX Settings</div>",
-        unsafe_allow_html=True,
-    )
-
-    def _refresh_log_top():
-        with _mcx_log_slot.container():
-            with st.expander("🪵 MCX Diagnostic Log", expanded=False):
-                st.code(
-                    "\n".join(_mcx_logs) if _mcx_logs else "(no log entries)",
-                    language="text",
-                )
-
-    # ── Top control row ──
-    mcx_r0 = st.columns([1.1, 0.9, 0.9, 0.9, 1.0, 1.4])
-    with mcx_r0[0]: mcx_date     = st.date_input("Date",          value=default_date,            key="mcx_date")
-    with mcx_r0[1]: mcx_interval = st.selectbox("Interval (min)", [1, 3, 5, 10, 15, 30, 60], index=2, key="mcx_interval")
-    with mcx_r0[2]: mcx_auto     = st.checkbox("Auto Refresh",    value=True,                    key="mcx_auto_ref")
-    with mcx_r0[3]: mcx_ref_secs = st.slider("Refresh (sec)",     5, 60, REFRESH_SECONDS,        key="mcx_ref_sec")
-    with mcx_r0[4]: mcx_pair_mini = st.checkbox(
-        "🔗 Pair Mini", value=True, key="mcx_pair_mini",
-        help="When ON, LEG 2 is auto-set to the MINI of LEG 1 (e.g., SILVER → SILVERM). "
-             "When OFF, LEG 2 can be any of the 8 contracts."
-    )
-    with mcx_r0[5]: mcx_fetch_btn = st.button("⟳  FETCH MCX DATA", use_container_width=True, type="primary", key="mcx_fetch_btn")
-
-    mcx_date_str = mcx_date.strftime("%Y-%m-%d")
-
-    # ── Leg configuration row — exchange fixed to MCX for both legs ──
-    mcx_legs = st.columns([0.2, 0.75, 0.75, 0.75, 0.65, 0.65,
-                            0.12,
-                            0.2, 0.75, 0.75, 0.75, 0.65, 0.65])
-
-    # --- LEG 1 ---
-    mcx_legs[0].markdown(
-        "<div style='padding-top:26px;font-size:10px;font-weight:700;"
-        "letter-spacing:1px;color:#dc2626;'>LEG 1<br>"
-        "<span style='color:#f59e0b;font-size:9px;'>MCX</span></div>",
-        unsafe_allow_html=True,
-    )
-    with mcx_legs[1]:
-        # LEG 1 is always one of the BIG contracts. (The mini sits in LEG 2.)
-        mcx_l1_under = st.selectbox("Underlying", MCX_UNDERLYINGS_BIG, index=0, key="mcx_l1_under")
-
-    # Expiries via the existing get_expiries_for — it already handles MCX:CRUDEOIL-INDEX
-    _mcx_l1_opts = get_expiries_for("MCX", mcx_l1_under)
-    _l1_sym = _UNDERLYING_SYM.get(mcx_l1_under.upper(), f"MCX:{mcx_l1_under}-INDEX")
-    _mcxlog(f"LEG1 underlying={mcx_l1_under} (chain-symbol={_l1_sym}) → "
-            f"{len(_mcx_l1_opts)} expiries: {list(_mcx_l1_opts.keys())[:6]}")
-    _refresh_log_top()
-
-    with mcx_legs[2]:
-        mcx_l1_ce_exp = expiry_selectbox(
-            "CE Expiry", _mcx_l1_opts, "mcx_l1_ce_man", "mcx_l1_ce_sel", ""
-        )
-    with mcx_legs[3]:
-        mcx_l1_pe_exp = expiry_selectbox(
-            "PE Expiry", _mcx_l1_opts, "mcx_l1_pe_man", "mcx_l1_pe_sel", ""
-        )
-    _l1_def, _l1_step = MCX_STRIKE_DEFAULTS.get(mcx_l1_under, (5000, 50))
-    with mcx_legs[4]:
-        mcx_l1_ce_str = st.number_input(
-            "CE Strike", value=_l1_def, step=_l1_step, key=f"mcx_l1_ce_str_{mcx_l1_under}"
-        )
-    with mcx_legs[5]:
-        mcx_l1_pe_str = st.number_input(
-            "PE Strike", value=_l1_def, step=_l1_step, key=f"mcx_l1_pe_str_{mcx_l1_under}"
-        )
-
-    # divider
-    mcx_legs[6].markdown(
-        "<div style='padding-top:26px;font-size:10px;color:#e2e8f0;text-align:center;'>│</div>",
-        unsafe_allow_html=True,
-    )
-
-    # --- LEG 2 ---
-    mcx_legs[7].markdown(
-        "<div style='padding-top:26px;font-size:10px;font-weight:700;"
-        "letter-spacing:1px;color:#0284c7;'>LEG 2<br>"
-        "<span style='color:#f59e0b;font-size:9px;'>MCX</span></div>",
-        unsafe_allow_html=True,
-    )
-    with mcx_legs[8]:
-        if mcx_pair_mini:
-            # Auto-paired: LEG 2 is forced to the MINI of LEG 1.
-            mcx_l2_under = MCX_BIG_TO_MINI.get(mcx_l1_under, MCX_UNDERLYINGS_MINI[0])
-            st.markdown(
-                "<div style='font-size:11px;color:#64748b;'>Underlying</div>"
-                f"<div style='padding:6px 0 0 0;font-size:14px;font-weight:600;color:#0284c7;'>"
-                f"🔗 {mcx_l2_under} <span style='font-size:9px;color:#94a3b8;'>(auto)</span></div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            # Free pick from any of the 8 (big + mini).
-            mcx_l2_under = st.selectbox(
-                "Underlying", MCX_UNDERLYINGS_ALL,
-                index=MCX_UNDERLYINGS_ALL.index(MCX_BIG_TO_MINI.get(mcx_l1_under, MCX_UNDERLYINGS_MINI[0])),
-                key="mcx_l2_under_free",
-            )
-
-    _mcx_l2_opts = get_expiries_for("MCX", mcx_l2_under)
-    _l2_sym = _UNDERLYING_SYM.get(mcx_l2_under.upper(), f"MCX:{mcx_l2_under}-INDEX")
-    _mcxlog(f"LEG2 underlying={mcx_l2_under} (chain-symbol={_l2_sym}) → "
-            f"{len(_mcx_l2_opts)} expiries: {list(_mcx_l2_opts.keys())[:6]}")
-    _refresh_log_top()
-
-    with mcx_legs[9]:
-        mcx_l2_ce_exp = expiry_selectbox(
-            "CE Expiry", _mcx_l2_opts, "mcx_l2_ce_man", "mcx_l2_ce_sel", ""
-        )
-    with mcx_legs[10]:
-        mcx_l2_pe_exp = expiry_selectbox(
-            "PE Expiry", _mcx_l2_opts, "mcx_l2_pe_man", "mcx_l2_pe_sel", ""
-        )
-    _l2_def, _l2_step = MCX_STRIKE_DEFAULTS.get(mcx_l2_under, (5000, 50))
-    with mcx_legs[11]:
-        mcx_l2_ce_str = st.number_input(
-            "CE Strike", value=_l2_def, step=_l2_step, key=f"mcx_l2_ce_str_{mcx_l2_under}"
-        )
-    with mcx_legs[12]:
-        mcx_l2_pe_str = st.number_input(
-            "PE Strike", value=_l2_def, step=_l2_step, key=f"mcx_l2_pe_str_{mcx_l2_under}"
-        )
-
-    # ── LEG 2 multiplier row ──
-    # spread_CE = L1_CE − (CE_ratio × L2_CE);   spread_PE = L1_PE − (PE_ratio × L2_PE)
-    # Recomputed on every render — change the ratio and the chart updates without re-fetching.
-    mcx_ratio_row = st.columns([0.2, 4.5, 1, 1, 0.5])
-    mcx_ratio_row[0].markdown(
-        "<div style='padding-top:30px;font-size:10px;font-weight:700;"
-        "letter-spacing:1px;color:#0284c7;'>⚖<br>L2</div>",
-        unsafe_allow_html=True,
-    )
-    mcx_ratio_row[1].markdown(
-        f"<div style='padding-top:30px;font-size:11px;color:#64748b;'>"
-        f"Spread CE = <b style='color:#dc2626;'>{mcx_l1_under} CE</b> − "
-        f"<b style='color:#0284c7;'>CE&nbsp;Ratio × {mcx_l2_under} CE</b><br>"
-        f"Spread PE = <b style='color:#dc2626;'>{mcx_l1_under} PE</b> − "
-        f"<b style='color:#0284c7;'>PE&nbsp;Ratio × {mcx_l2_under} PE</b>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-    with mcx_ratio_row[2]:
-        mcx_l2_ce_ratio = st.number_input(
-            "CE Ratio", value=1.00, step=0.05, min_value=0.0,
-            format="%.2f", key="mcx_l2_ce_ratio",
-            help="Multiplier applied to LEG 2 CE before subtracting from LEG 1 CE.",
-        )
-    with mcx_ratio_row[3]:
-        mcx_l2_pe_ratio = st.number_input(
-            "PE Ratio", value=1.00, step=0.05, min_value=0.0,
-            format="%.2f", key="mcx_l2_pe_ratio",
-            help="Multiplier applied to LEG 2 PE before subtracting from LEG 1 PE.",
-        )
-    _mcxlog(f"Ratios → CE={mcx_l2_ce_ratio} PE={mcx_l2_pe_ratio}")
-
-    st.divider()
-
-    # ── Show which symbols will be built (debug info — hidden unless expiry available) ──
-    _l1_ce_exp_ok = bool(mcx_l1_ce_exp and mcx_l1_ce_exp.strip())
-    _l1_pe_exp_ok = bool(mcx_l1_pe_exp and mcx_l1_pe_exp.strip())
-    _l2_ce_exp_ok = bool(mcx_l2_ce_exp and mcx_l2_ce_exp.strip())
-    _l2_pe_exp_ok = bool(mcx_l2_pe_exp and mcx_l2_pe_exp.strip())
-    _all_exp_ok   = _l1_ce_exp_ok and _l1_pe_exp_ok and _l2_ce_exp_ok and _l2_pe_exp_ok
-    _mcxlog(f"Expiry selections → L1 CE={mcx_l1_ce_exp!r} PE={mcx_l1_pe_exp!r} | "
-            f"L2 CE={mcx_l2_ce_exp!r} PE={mcx_l2_pe_exp!r}")
-    _mcxlog(f"All expiries OK? {_all_exp_ok} "
-            f"(L1CE={_l1_ce_exp_ok} L1PE={_l1_pe_exp_ok} L2CE={_l2_ce_exp_ok} L2PE={_l2_pe_exp_ok})")
-
-    if _all_exp_ok:
-        _sym_l1_ce = build_symbol("MCX", mcx_l1_under, mcx_l1_ce_exp, "C", int(mcx_l1_ce_str))
-        _sym_l1_pe = build_symbol("MCX", mcx_l1_under, mcx_l1_pe_exp, "P", int(mcx_l1_pe_str))
-        _sym_l2_ce = build_symbol("MCX", mcx_l2_under, mcx_l2_ce_exp, "C", int(mcx_l2_ce_str))
-        _sym_l2_pe = build_symbol("MCX", mcx_l2_under, mcx_l2_pe_exp, "P", int(mcx_l2_pe_str))
-        st.markdown(
-            f"<div style='font-size:10px;color:#64748b;font-family:monospace;margin-bottom:6px;'>"
-            f"Symbols: "
-            f"<span style='color:#dc2626;'>{_sym_l1_ce}</span> · "
-            f"<span style='color:#dc2626;'>{_sym_l1_pe}</span> &nbsp;|&nbsp; "
-            f"<span style='color:#0284c7;'>{_sym_l2_ce}</span> · "
-            f"<span style='color:#0284c7;'>{_sym_l2_pe}</span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.info("⏳ Waiting for expiry data from Fyers… Select underlying and expiry will populate automatically.")
-
-    # ── Fetch on button click ONLY (no auto-fetch on empty) ──
-    def _fetch_mcx_data():
-        _mcxlog("── FETCH started ──")
-        if not _all_exp_ok:
-            _mcxlog("ABORT: expiries not all set.")
-            st.warning("⚠️ Expiry not set. Please wait for expiry dropdown to populate.")
-            return pd.DataFrame()
-        fyers = get_fyers_client()
-        if fyers is None:
-            _mcxlog("ABORT: get_fyers_client() returned None (login/token failure).")
-            return pd.DataFrame()
-        _mcxlog("Fyers client OK.")
-        sym_l1_ce = build_symbol("MCX", mcx_l1_under, mcx_l1_ce_exp, "C", int(mcx_l1_ce_str))
-        sym_l1_pe = build_symbol("MCX", mcx_l1_under, mcx_l1_pe_exp, "P", int(mcx_l1_pe_str))
-        sym_l2_ce = build_symbol("MCX", mcx_l2_under, mcx_l2_ce_exp, "C", int(mcx_l2_ce_str))
-        sym_l2_pe = build_symbol("MCX", mcx_l2_under, mcx_l2_pe_exp, "P", int(mcx_l2_pe_str))
-        _mcxlog(f"Symbols built: {sym_l1_ce} | {sym_l1_pe} | {sym_l2_ce} | {sym_l2_pe}")
-        _mcxlog(f"Fetching candles: interval={mcx_interval} date={mcx_date_str}")
-        with st.spinner("Fetching MCX option data from Fyers…"):
-            df_l1_ce = fetch_candles(fyers, sym_l1_ce, mcx_interval, mcx_date_str)
-            df_l1_pe = fetch_candles(fyers, sym_l1_pe, mcx_interval, mcx_date_str)
-            df_l2_ce = fetch_candles(fyers, sym_l2_ce, mcx_interval, mcx_date_str)
-            df_l2_pe = fetch_candles(fyers, sym_l2_pe, mcx_interval, mcx_date_str)
-        _mcxlog(f"Rows returned → L1CE={len(df_l1_ce)} L1PE={len(df_l1_pe)} "
-                f"L2CE={len(df_l2_ce)} L2PE={len(df_l2_pe)}")
-        missing = [n for n, d in [
-            (sym_l1_ce, df_l1_ce), (sym_l1_pe, df_l1_pe),
-            (sym_l2_ce, df_l2_ce), (sym_l2_pe, df_l2_pe),
-        ] if d.empty]
-        if missing:
-            _mcxlog(f"ABORT: empty data for {missing}")
-            st.warning(f"⚠️ No data returned for: `{'` | `'.join(missing)}`")
-            return pd.DataFrame()
-        for _d in [df_l1_ce, df_l1_pe, df_l2_ce, df_l2_pe]:
-            _d.drop_duplicates(keep="last", inplace=True)
-        df_l1_ce = df_l1_ce[~df_l1_ce.index.duplicated(keep="last")]
-        df_l1_pe = df_l1_pe[~df_l1_pe.index.duplicated(keep="last")]
-        df_l2_ce = df_l2_ce[~df_l2_ce.index.duplicated(keep="last")]
-        df_l2_pe = df_l2_pe[~df_l2_pe.index.duplicated(keep="last")]
-        common = (df_l1_ce.index
-                  .intersection(df_l1_pe.index)
-                  .intersection(df_l2_ce.index)
-                  .intersection(df_l2_pe.index))
-        _mcxlog(f"Common timestamps across all 4 series: {len(common)}")
-        if common.empty:
-            _mcxlog("ABORT: no overlapping timestamps.")
-            st.warning("⚠️ No overlapping timestamps across all 4 series.")
-            return pd.DataFrame()
-        out = pd.DataFrame({
-            "l1_ce": df_l1_ce["close"].reindex(common),
-            "l1_pe": df_l1_pe["close"].reindex(common),
-            "l2_ce": df_l2_ce["close"].reindex(common),
-            "l2_pe": df_l2_pe["close"].reindex(common),
-        }).dropna()
-        # Spreads are applied at render-time (so ratio edits redraw instantly).
-        _mcxlog(f"SUCCESS: built raw frame with {len(out)} rows (ratios applied at render).")
-        return out
-
-    _mcxlog(f"Fetch button pressed? {bool(mcx_fetch_btn)}")
-    if mcx_fetch_btn:
-        st.session_state.df_mcx = _fetch_mcx_data()
-
-    df_mcx = st.session_state.df_mcx
-    _mcxlog(f"df_mcx in session_state: {len(df_mcx)} rows (empty={df_mcx.empty})")
-
-    # ── Apply ratios at render-time so the chart redraws when CE/PE Ratio changes,
-    # without re-hitting the Fyers API.
-    if not df_mcx.empty and {"l1_ce", "l1_pe", "l2_ce", "l2_pe"}.issubset(df_mcx.columns):
-        df_mcx = df_mcx.copy()
-        df_mcx["ce_spread"] = df_mcx["l1_ce"] - df_mcx["l2_ce"] * mcx_l2_ce_ratio
-        df_mcx["pe_spread"] = df_mcx["l1_pe"] - df_mcx["l2_pe"] * mcx_l2_pe_ratio
-
-    # ── Results ──
-    if df_mcx.empty:
-        if not mcx_fetch_btn:
-            st.info("👆 Select underlyings + strikes above, then click **Fetch MCX Data**.")
-    else:
-        latest_mcx   = df_mcx.iloc[-1]
-        mcx_ce_val   = latest_mcx["ce_spread"]
-        mcx_pe_val   = latest_mcx["pe_spread"]
-        mcx_updated  = df_mcx.index[-1].strftime("%H:%M:%S")
-        mcx_ce_delta = mcx_ce_val - df_mcx["ce_spread"].iloc[-2] if len(df_mcx) > 1 else 0
-        mcx_pe_delta = mcx_pe_val - df_mcx["pe_spread"].iloc[-2] if len(df_mcx) > 1 else 0
-
-        def _mcx_arrow(v):
-            arrow = "▲" if v >= 0 else "▼"
-            color = "#f87171" if v >= 0 else "#34d399"
-            return f"<span style='color:{color};font-size:11px;font-family:\"Space Mono\",monospace;'>{arrow} {abs(v):.2f}</span>"
-
-        # ── 3-card metrics (CE Spread | PE Spread | Last Update) ──
-        st.markdown(f"""
-        <div class="metrics-grid" style="grid-template-columns:repeat(3,1fr);">
-            <div class="metric-card card-ce">
-                <div class="metric-badge">📈</div>
-                <div class="metric-label">CE SPREAD</div>
-                <div class="metric-value val-ce">{mcx_ce_val:+.2f}</div>
-                <div class="metric-sub">{mcx_l1_under} CE &minus; {mcx_l2_ce_ratio:g}×{mcx_l2_under} CE &nbsp; {_mcx_arrow(mcx_ce_delta)}</div>
-            </div>
-            <div class="metric-card card-pe">
-                <div class="metric-badge">📉</div>
-                <div class="metric-label">PE SPREAD</div>
-                <div class="metric-value val-pe">{mcx_pe_val:+.2f}</div>
-                <div class="metric-sub">{mcx_l1_under} PE &minus; {mcx_l2_pe_ratio:g}×{mcx_l2_under} PE &nbsp; {_mcx_arrow(mcx_pe_delta)}</div>
-            </div>
-            <div class="metric-card card-time">
-                <div class="metric-badge">🕐</div>
-                <div class="metric-label">LAST UPDATE</div>
-                <div class="metric-value val-time">{mcx_updated}</div>
-                <div class="metric-sub">{'LIVE' if mcx_date_str == date.today().strftime('%Y-%m-%d') else 'HISTORICAL'} &nbsp;&middot;&nbsp; {len(df_mcx)} candles</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # ── Two separate chart sub-tabs ──
-        _mcx_ct_ce, _mcx_ct_pe = st.tabs(["📈 CE Spread Chart", "📉 PE Spread Chart"])
-
-        def _mcx_layout(fig, title, height=480):
-            fig.update_layout(
-                title=dict(text=title, font=dict(size=12, color=T["text2"]), x=0),
-                height=height,
-                plot_bgcolor=T["plot_bg"], paper_bgcolor=T["plot_bg"],
-                font=dict(color=T["text2"], family="Space Mono"),
-                hovermode="x unified",
-                margin=dict(l=10, r=10, t=40, b=10),
-                legend=dict(
-                    bgcolor=T["card"], bordercolor=T["card_bdr"], borderwidth=1,
-                    orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
-                ),
-                xaxis=dict(
-                    gridcolor=T["grid"], tickfont=dict(size=10),
-                    showspikes=True, spikemode="across",
-                    spikecolor=T["text3"], spikethickness=1, spikedash="dot",
-                ),
-                yaxis=dict(
-                    gridcolor=T["grid"], title="Spread (₹)", tickfont=dict(size=10),
-                    showspikes=True, spikemode="across",
-                    spikecolor=T["text3"], spikethickness=1, spikedash="dot",
-                ),
-                hoverlabel=dict(
-                    bgcolor=T["card"], bordercolor=T["card_bdr"], font=dict(color=T["text"])
-                ),
-            )
-
-        def _mcx_hlines(fig, series, color):
-            h, l = series.max(), series.min()
-            fig.add_hline(y=0, line_dash="dash", line_color="#555")
-            fig.add_hline(
-                y=h, line_dash="dot", line_color=color, line_width=1, opacity=0.65,
-                annotation_text=f"H: {h:.2f}", annotation_position="right",
-                annotation_font=dict(color=color, size=10),
-            )
-            fig.add_hline(
-                y=l, line_dash="dot", line_color=color, line_width=1, opacity=0.65,
-                annotation_text=f"L: {l:.2f}", annotation_position="right",
-                annotation_font=dict(color=color, size=10),
-            )
-
-        _ce_label = f"{mcx_l1_under} CE − {mcx_l2_ce_ratio:g}×{mcx_l2_under} CE"
-        _pe_label = f"{mcx_l1_under} PE − {mcx_l2_pe_ratio:g}×{mcx_l2_under} PE"
-
-        with _mcx_ct_ce:
-            fig_ce = go.Figure()
-            fig_ce.add_trace(go.Scatter(
-                x=df_mcx.index, y=df_mcx["ce_spread"],
-                name=_ce_label,
-                line=dict(color="#ff4444", width=2.5),
-                fill="tozeroy", fillcolor="rgba(255,68,68,0.07)",
-                hovertemplate="%{x|%H:%M}<br>CE Spread: %{y:.2f}<extra></extra>",
-            ))
-            _mcx_hlines(fig_ce, df_mcx["ce_spread"], "#ff4444")
-            _mcx_layout(fig_ce, f"MCX CE Spread — {_ce_label}")
-            st.plotly_chart(fig_ce, use_container_width=True)
-
-            with st.expander("📋 CE Spread Data (last 20 candles)"):
-                _d_ce = pd.DataFrame({
-                    f"L1 {mcx_l1_under} CE ({mcx_l1_ce_exp})":               df_mcx["l1_ce"].astype(float),
-                    f"L2 {mcx_l2_under} CE ({mcx_l2_ce_exp})":                df_mcx["l2_ce"].astype(float),
-                    f"L2×{mcx_l2_ce_ratio:g}":                                (df_mcx["l2_ce"] * mcx_l2_ce_ratio).astype(float),
-                    "CE Spread":                                              df_mcx["ce_spread"].astype(float),
-                }).tail(20).round(2)
-                _d_ce.index = _d_ce.index.strftime("%H:%M")
-                # Avoid pandas Styler — PyArrow on Python 3.14 fails on Styler's
-                # internal display dataframe even when the source columns are unique.
-                st.dataframe(_d_ce, use_container_width=True)
-
-        with _mcx_ct_pe:
-            fig_pe = go.Figure()
-            fig_pe.add_trace(go.Scatter(
-                x=df_mcx.index, y=df_mcx["pe_spread"],
-                name=_pe_label,
-                line=dict(color="#44ff88", width=2.5),
-                fill="tozeroy", fillcolor="rgba(68,255,136,0.07)",
-                hovertemplate="%{x|%H:%M}<br>PE Spread: %{y:.2f}<extra></extra>",
-            ))
-            _mcx_hlines(fig_pe, df_mcx["pe_spread"], "#44ff88")
-            _mcx_layout(fig_pe, f"MCX PE Spread — {_pe_label}")
-            st.plotly_chart(fig_pe, use_container_width=True)
-
-            with st.expander("📋 PE Spread Data (last 20 candles)"):
-                _d_pe = pd.DataFrame({
-                    f"L1 {mcx_l1_under} PE ({mcx_l1_pe_exp})":               df_mcx["l1_pe"].astype(float),
-                    f"L2 {mcx_l2_under} PE ({mcx_l2_pe_exp})":                df_mcx["l2_pe"].astype(float),
-                    f"L2×{mcx_l2_pe_ratio:g}":                                (df_mcx["l2_pe"] * mcx_l2_pe_ratio).astype(float),
-                    "PE Spread":                                              df_mcx["pe_spread"].astype(float),
-                }).tail(20).round(2)
-                _d_pe.index = _d_pe.index.strftime("%H:%M")
-                st.dataframe(_d_pe, use_container_width=True)
-
-    _mcxlog("── tab5 render end ──")
-    _refresh_log_top()
-
-    # ── MCX Auto Refresh — flag for deferred rerun ──
-    if mcx_auto and mcx_date_str == date.today().strftime("%Y-%m-%d") and not df_mcx.empty:
-        st.session_state["_mcx_rerun_pending"] = True
-
-
-# ─────────────────────────────────────────────
-# DEFERRED AUTO-REFRESH — runs AFTER all tabs have rendered.
-# Tab 1 / Tab 3 / Tab 5 each set a *_rerun_pending flag in session_state.
-# We honor them here so no tab can short-circuit the rendering of another.
-# ─────────────────────────────────────────────
-
-_any_refresh = (
-    st.session_state.pop("_main_rerun_pending", False)
-    or st.session_state.pop("_iv_rerun_pending", False)
-    or st.session_state.pop("_mcx_rerun_pending", False)
-)
-if _any_refresh:
-    # Sleep once for the *shortest* configured interval (refresh_secs from Tab 1
-    # is the canonical one), then refetch live tab-1 data and rerun.
-    try:
-        time.sleep(refresh_secs)
-    except Exception:
-        time.sleep(5)
-    try:
-        st.session_state.df = fetch_live_data()
-    except Exception:
-        pass
+    time.sleep(refresh_secs)
+    st.session_state.df = fetch_live_data()
     st.rerun()
