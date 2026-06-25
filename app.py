@@ -89,21 +89,29 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         data = r4d.get("data", {})
 
         def _extract_auth_code(url_str):
-            """Pull auth_code out of a redirect URL WITHOUT mangling '+' into spaces.
-            parse_qs() does form-encoding-style unescaping, which corrupts base64
-            tokens that legitimately contain '+'. We extract the raw substring and
-            only unquote %XX sequences, leaving '+' untouched."""
+            """Extract auth code from a Fyers redirect URL.
+            Fyers v3 uses ?s=ok&code=<token>&state=... (key is 'code', not 'auth_code').
+            We use a raw regex + unquote (NOT unquote_plus) to preserve literal '+' chars
+            that appear in base64-encoded tokens."""
             if not url_str:
                 return None
+            # Try 'code=' first (Fyers v3 standard)
+            m = re.search(r'[?&]code=([^&]+)', url_str)
+            if m:
+                return unquote(m.group(1))
+            # Fallback: legacy 'auth_code=' key
             m = re.search(r'auth_code=([^&]+)', url_str)
-            if not m:
-                return None
-            return unquote(m.group(1))  # unquote, NOT unquote_plus — preserves literal '+'
+            if m:
+                return unquote(m.group(1))
+            return None
 
+        # Priority order: direct keys first, then parse from redirect URLs
         auth_code = (
-            data.get("auth")
-            or _extract_auth_code(r4d.get("Url", ""))
-            or _extract_auth_code(data.get("url", ""))
+            data.get("auth_code")                        # direct key (some versions)
+            or data.get("auth")                          # legacy direct key
+            or _extract_auth_code(r4d.get("Url", ""))   # top-level Url field
+            or _extract_auth_code(data.get("url", ""))  # nested url field
+            or _extract_auth_code(r4d.get("url", ""))   # top-level url field (alt casing)
         )
         if not auth_code:
             return None, f"Step 4: no auth_code in response: {r4d}"
@@ -130,7 +138,7 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         if not token:
             debug_info = (
                 f" [debug: code_len={len(auth_code)}, code_preview={auth_code[:6]}...{auth_code[-6:]}, "
-                f"hash_prefix={app_id_hash[:10]}..., app_id={app_id}]"
+                f"hash_prefix={app_id_hash[:10]}..., app_id={app_id}, r4d_keys={list(r4d.keys())}, data_keys={list(data.keys() if isinstance(data, dict) else [])}]"
             )
             return None, f"Step 5 failed: {r5d}{debug_info}"
         return token, None
