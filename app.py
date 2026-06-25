@@ -105,13 +105,13 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
                 return unquote(m.group(1))
             return None
 
-        # Priority order: direct keys first, then parse from redirect URLs
+        # Priority order: r4d["code"] is the correct top-level key in Fyers v3
         auth_code = (
-            data.get("auth_code")                        # direct key (some versions)
-            or data.get("auth")                          # legacy direct key
-            or _extract_auth_code(r4d.get("Url", ""))   # top-level Url field
-            or _extract_auth_code(data.get("url", ""))  # nested url field
-            or _extract_auth_code(r4d.get("url", ""))   # top-level url field (alt casing)
+            r4d.get("code")                              # ✅ Fyers v3: top-level "code" key
+            or data.get("auth_code")                     # fallback: nested auth_code
+            or _extract_auth_code(r4d.get("Url", ""))   # fallback: parse redirect URL
+            or _extract_auth_code(data.get("url", ""))  # fallback: parse nested url
+            or _extract_auth_code(r4d.get("url", ""))   # fallback: alt casing
         )
         if not auth_code:
             return None, f"Step 4: no auth_code in response: {r4d}"
