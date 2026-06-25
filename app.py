@@ -105,19 +105,23 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
                 return unquote(m.group(1))
             return None
 
-        # Priority order: r4d["code"] is the correct top-level key in Fyers v3
+        # ── Fyers returns the access token directly in data["auth"] ──
+        # data["auth"] is the final JWT — no Step 5 exchange needed when present.
+        direct_token = data.get("auth")
+        if direct_token:
+            return direct_token, None
+
+        # Fallback: if data["auth"] absent, try auth_code exchange via validate-authcode
         auth_code = (
-            r4d.get("code")                              # ✅ Fyers v3: top-level "code" key
-            or data.get("auth_code")                     # fallback: nested auth_code
-            or _extract_auth_code(r4d.get("Url", ""))   # fallback: parse redirect URL
-            or _extract_auth_code(data.get("url", ""))  # fallback: parse nested url
-            or _extract_auth_code(r4d.get("url", ""))   # fallback: alt casing
+            r4d.get("code")
+            or data.get("auth_code")
+            or _extract_auth_code(r4d.get("Url", ""))
+            or _extract_auth_code(data.get("url", ""))
+            or _extract_auth_code(r4d.get("url", ""))
         )
         if not auth_code:
-            return None, f"Step 4: no auth_code in response: {r4d}"
+            return None, f"Step 4: no auth_code or direct token in response: {r4d}"
 
-        # ── FIX: use app_id (without "-100") for the SHA-256 hash, NOT client_id ──
-        # Fyers validate-authcode expects: sha256("APP_ID_PREFIX:SECRET_KEY")
         app_id_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
         r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
             "grant_type": "authorization_code",
@@ -127,7 +131,6 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         r5d = r5.json()
         token = r5d.get("access_token")
         if not token:
-            # Fallback: try legacy SDK exchange
             session = fyersModel.SessionModel(
                 client_id=client_id, secret_key=secret_key,
                 redirect_uri=redirect_uri, response_type="code", grant_type="authorization_code"
@@ -138,7 +141,7 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         if not token:
             debug_info = (
                 f" [debug: code_len={len(auth_code)}, code_preview={auth_code[:6]}...{auth_code[-6:]}, "
-                f"hash_prefix={app_id_hash[:10]}..., app_id={app_id}, r4d_keys={list(r4d.keys())}, data_keys={list(data.keys() if isinstance(data, dict) else [])}]"
+                f"hash_prefix={app_id_hash[:10]}..., app_id={app_id}]"
             )
             return None, f"Step 5 failed: {r5d}{debug_info}"
         return token, None
