@@ -76,7 +76,7 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         if r3d.get("s") != "ok":
             return None, f"Step 3 failed: {r3d}"
 
-        app_id = client_id.split("-")[0]  # e.g. "G9SMNCTH4S" (no "-100")
+        app_id = client_id.split("-")[0]
         r4 = s.post("https://api-t1.fyers.in/api/v3/token", json={
             "fyers_id": username, "app_id": app_id, "redirect_uri": redirect_uri,
             "appType": "100", "code_challenge": "", "state": "sample",
@@ -89,40 +89,28 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         data = r4d.get("data", {})
 
         def _extract_auth_code(url_str):
-            """Extract auth code from a Fyers redirect URL.
-            Fyers v3 uses ?s=ok&code=<token>&state=... (key is 'code', not 'auth_code').
-            We use a raw regex + unquote (NOT unquote_plus) to preserve literal '+' chars
-            that appear in base64-encoded tokens."""
+            """Pull auth_code out of a redirect URL WITHOUT mangling '+' into spaces.
+            parse_qs() does form-encoding-style unescaping, which corrupts base64
+            tokens that legitimately contain '+'. We extract the raw substring and
+            only unquote %XX sequences, leaving '+' untouched."""
             if not url_str:
                 return None
-            # Try 'code=' first (Fyers v3 standard)
-            m = re.search(r'[?&]code=([^&]+)', url_str)
-            if m:
-                return unquote(m.group(1))
-            # Fallback: legacy 'auth_code=' key
             m = re.search(r'auth_code=([^&]+)', url_str)
-            if m:
-                return unquote(m.group(1))
-            return None
+            if not m:
+                return None
+            return unquote(m.group(1))  # unquote, NOT unquote_plus — preserves literal '+'
 
-        # ── Fyers returns the access token directly in data["auth"] ──
-        # data["auth"] is the final JWT — no Step 5 exchange needed when present.
-        direct_token = data.get("auth")
-        if direct_token:
-            return direct_token, None
-
-        # Fallback: if data["auth"] absent, try auth_code exchange via validate-authcode
         auth_code = (
-            r4d.get("code")
-            or data.get("auth_code")
+            data.get("auth")
             or _extract_auth_code(r4d.get("Url", ""))
             or _extract_auth_code(data.get("url", ""))
-            or _extract_auth_code(r4d.get("url", ""))
         )
         if not auth_code:
-            return None, f"Step 4: no auth_code or direct token in response: {r4d}"
+            return None, f"Step 4: no auth_code in response: {r4d}"
 
-        app_id_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
+        # New Fyers API: exchange auth_code via validate-authcode using SHA-256 app hash
+        # Fyers requires the FULL client_id (including the "-100" suffix), not just the app_id portion
+        app_id_hash = hashlib.sha256(f"{client_id}:{secret_key}".encode()).hexdigest()
         r5 = s.post("https://api-t1.fyers.in/api/v3/validate-authcode", json={
             "grant_type": "authorization_code",
             "appIdHash": app_id_hash,
@@ -131,6 +119,7 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         r5d = r5.json()
         token = r5d.get("access_token")
         if not token:
+            # Fallback: try legacy SDK exchange
             session = fyersModel.SessionModel(
                 client_id=client_id, secret_key=secret_key,
                 redirect_uri=redirect_uri, response_type="code", grant_type="authorization_code"
@@ -141,7 +130,7 @@ def generate_token(client_id, secret_key, username, pin, totp_key):
         if not token:
             debug_info = (
                 f" [debug: code_len={len(auth_code)}, code_preview={auth_code[:6]}...{auth_code[-6:]}, "
-                f"hash_prefix={app_id_hash[:10]}..., app_id={app_id}]"
+                f"hash_prefix={app_id_hash[:10]}..., client_id={client_id}]"
             )
             return None, f"Step 5 failed: {r5d}{debug_info}"
         return token, None
@@ -1296,27 +1285,34 @@ with tab3:
                 last_nf = df_nf_s["close"].iloc[-1]
 
                 # Compute Synthetic Fut - Multiplier from spot prices
+                # synth_ratio = synth_sensex / synth_nifty ≈ spot_sensex / spot_nifty (no options here)
+                # Use per-minute ratio series, take last value
                 common_ts = df_sx_s.index.intersection(df_nf_s.index)
                 synth_mult_series = df_sx_s["close"].reindex(common_ts) / df_nf_s["close"].reindex(common_ts)
                 iv_mult = round(float(synth_mult_series.dropna().iloc[-1]), 4)
                 st.session_state["iv_synth_mult"] = iv_mult
 
                 # ── Dynamic ATM: compute per-minute strikes ──
+                # Graph 1 = ATM strike, Graph 2 = ATM + 500
                 sx_prices = df_sx_s["close"].reindex(common_ts)
 
+                # ATM = nearest 500 (rounded, not floor)
+                # Graph 1 = ATM strike, Graph 2 = ATM + 500
                 def atm_nearest(s):
                     return int(round(float(s) / 500) * 500)
 
-                lo_sx_series = sx_prices.apply(atm_nearest)
-                hi_sx_series = lo_sx_series.apply(lambda k: k + 500)
+                lo_sx_series = sx_prices.apply(atm_nearest)          # per-minute ATM
+                hi_sx_series = lo_sx_series.apply(lambda k: k + 500) # per-minute ATM+500
                 lo_nf_series = (lo_sx_series / synth_mult_series.reindex(lo_sx_series.index).ffill()).apply(lambda k: round_to(k, 50))
                 hi_nf_series = (hi_sx_series / synth_mult_series.reindex(hi_sx_series.index).ffill()).apply(lambda k: round_to(k, 50))
 
+                # All unique strikes needed
                 uniq_sx_lo = sorted(lo_sx_series.unique())
                 uniq_sx_hi = sorted(hi_sx_series.unique())
                 uniq_nf_lo = sorted(lo_nf_series.unique())
                 uniq_nf_hi = sorted(hi_nf_series.unique())
 
+                # Fetch all unique option series
                 all_syms = {}
                 for k in uniq_sx_lo:
                     all_syms[f"sx_lo_CE_{k}"] = build_symbol("BSE","SENSEX", sx_iv_expiry,"C", int(k))
@@ -1337,11 +1333,13 @@ with tab3:
                         df_o = fetch_candles(fyers, sym, iv_interval, iv_date_str)
                         fetched[key] = df_o[~df_o.index.duplicated(keep="last")] if not df_o.empty else df_o
 
+                # ── Compute IV per minute using that minute's ATM strike ──
                 r = iv_rate / 100
                 exp_sx = expiry_to_date(sx_iv_expiry)
                 exp_nf = expiry_to_date(nf_iv_expiry)
 
                 def dynamic_iv_series(spot_df, strike_series, fetched_dict, prefix, expiry_dt, opt_type):
+                    """Build IV series where strike can change each minute."""
                     out_iv     = {}
                     out_strike = {}
                     valid_ts   = spot_df.index.intersection(strike_series.index)
@@ -1366,7 +1364,9 @@ with tab3:
                 iv_nf_hi_CE, sk_nf_hi_CE = dynamic_iv_series(df_nf_s, hi_nf_series, fetched, "nf_hi_CE", exp_nf, "CE")
                 iv_nf_hi_PE, sk_nf_hi_PE = dynamic_iv_series(df_nf_s, hi_nf_series, fetched, "nf_hi_PE", exp_nf, "PE")
 
+                # Strike-change timestamps — debounced (strike must hold for 3+ candles)
                 def strike_changes(sk_series, min_candles=3):
+                    """Only mark a strike change if new strike persists min_candles."""
                     if sk_series.empty:
                         return []
                     items = list(sk_series.items())
@@ -1411,6 +1411,7 @@ with tab3:
                 st.session_state["iv_lo_nf"]     = int(lo_nf_series.iloc[-1])
                 st.session_state["iv_hi_nf"]     = int(hi_nf_series.iloc[-1])
                 st.session_state["iv_last_sx"]   = last_sx
+                # Strike ranges used across the day
                 st.session_state["iv_lo_sx_range"] = sorted(lo_sx_series.unique())
                 st.session_state["iv_hi_sx_range"] = sorted(hi_sx_series.unique())
                 st.session_state["iv_lo_nf_range"] = sorted(lo_nf_series.unique())
@@ -1482,6 +1483,7 @@ with tab3:
                         hovertemplate="%{text}<extra>" + name + "</extra>",
                     ))
 
+            # Strike-change vertical lines — Sensex (orange) and Nifty (purple)
             for ts, new_k in (chg_sx or []):
                 fig.add_shape(type="line", x0=str(ts), x1=str(ts), y0=0, y1=1,
                     xref="x", yref="paper",
@@ -1512,6 +1514,7 @@ with tab3:
             )
             return fig
 
+        # Graph 1
         st.markdown(f"<div style='font-size:12px;font-weight:700;color:#64748b;margin:10px 0 6px 0;'>📉 Graph 1 — Sensex ATM &nbsp;<span style='color:#f87171'>{range_label(lo_sx_range)}</span> &nbsp;/ Nifty <span style='color:#60a5fa'>{range_label(lo_nf_range)}</span> &nbsp;<span style='font-weight:400;font-size:11px;'>(dynamic ATM · closing: {lo_sx}/{lo_nf})</span></div>", unsafe_allow_html=True)
         c1,c2,c3,c4 = st.columns(4)
         c1.markdown(card(f"Sensex ATM CE IV ({range_label(lo_sx_range)})", iv_res.get("sx_lo_CE"), COLORS["sx_CE"], SENSEX_LOT), unsafe_allow_html=True)
@@ -1520,12 +1523,14 @@ with tab3:
         c4.markdown(card(f"Nifty ATM PE IV ({range_label(lo_nf_range)})",  iv_res.get("nf_lo_PE"), COLORS["nf_PE"], NIFTY_LOT),  unsafe_allow_html=True)
         st.plotly_chart(iv_chart("sx_lo", lo_sx, lo_nf, f"IV % — Sensex ATM {range_label(lo_sx_range)} & Nifty ATM {range_label(lo_nf_range)}", iv_changes.get("lo_sx"), iv_changes.get("lo_nf")), use_container_width=True)
 
+        # ── IV Differential Charts ──
         def diff_chart(ce_sx_key, ce_nf_key, pe_sx_key, pe_nf_key, title):
             fig = go.Figure()
             ce_sx = iv_res.get(ce_sx_key, pd.Series(dtype=float)).dropna()
             ce_nf = iv_res.get(ce_nf_key, pd.Series(dtype=float)).dropna()
             pe_sx = iv_res.get(pe_sx_key, pd.Series(dtype=float)).dropna()
             pe_nf = iv_res.get(pe_nf_key, pd.Series(dtype=float)).dropna()
+            # CE diff
             common_ce = ce_sx.index.intersection(ce_nf.index)
             if len(common_ce) > 0:
                 ce_diff = ce_sx.reindex(common_ce) - ce_nf.reindex(common_ce)
@@ -1533,6 +1538,7 @@ with tab3:
                     name=f"CE Diff (last: {ce_diff.iloc[-1]:.1f}%)",
                     line=dict(color="#f87171", width=2),
                     hovertemplate="CE Diff: %{y:.2f}%<extra></extra>"))
+            # PE diff
             common_pe = pe_sx.index.intersection(pe_nf.index)
             if len(common_pe) > 0:
                 pe_diff = pe_sx.reindex(common_pe) - pe_nf.reindex(common_pe)
@@ -1559,6 +1565,7 @@ with tab3:
         st.markdown("<div style='font-size:12px;font-weight:700;color:#64748b;margin:16px 0 6px 0;'>📊 IV Differential — Sensex IV − Nifty IV (ATM)</div>", unsafe_allow_html=True)
         st.plotly_chart(diff_chart("sx_lo_CE","nf_lo_CE","sx_lo_PE","nf_lo_PE", "Sensex CE IV − Nifty CE IV  &  Sensex PE IV − Nifty PE IV"), use_container_width=True)
 
+        # ── Auto Refresh ──
         if iv_auto and iv_date_str == date.today().strftime("%Y-%m-%d"):
             time.sleep(iv_ref_secs)
             st.session_state["_iv_rerun"] = True
@@ -1567,7 +1574,6 @@ with tab3:
     else:
         st.info("👆 Set expiry dates above and click **Fetch IV Data**.")
 
-# ─────────────────────────────────────────────
 # AUTO REFRESH
 # ─────────────────────────────────────────────
 
