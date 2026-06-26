@@ -209,27 +209,13 @@ def _save_expiry_cache(expiries):
     except Exception: pass
 
 def _fetch_expiries(fyers_sym):
-    """Hits Fyers optionchain API with retry-on-rate-limit (handles -15/429 bursts)."""
     from collections import defaultdict
     token, err = get_shared_token()
     if not token: return {}, f"No token: {err}"
     cid = get_secret("FYERS_CLIENT_ID")
     fyers = fyersModel.FyersModel(client_id=cid, token=token, log_path="")
-
-    resp = None
-    for attempt in range(3):
-        resp = fyers.optionchain(data={"symbol":fyers_sym,"strikecount":1,"timestamp":""})
-        if resp and resp.get("s") == "ok":
-            break
-        # -15 / 429 right after a burst of calls is usually rate-limiting, not a bad token —
-        # back off briefly and retry before giving up.
-        code = (resp or {}).get("code")
-        if code in (-15, 429) and attempt < 2:
-            time.sleep(1.5 * (attempt + 1))
-            continue
-        break
-
-    if not (resp and resp.get("s") == "ok"):
+    resp = fyers.optionchain(data={"symbol":fyers_sym,"strikecount":1,"timestamp":""})
+    if not (resp and resp.get("s")=="ok"):
         return {}, f"optionchain API returned: {resp}"
     raw = resp.get("data",{}).get("expiryData",[])
     parsed = []
@@ -497,7 +483,6 @@ with tab2:
                         st.warning(f"⚠️ {leg_labels[i]}: No data — `{sym}`")
                         ok=False;break
                     raw.append(df_[~df_.index.duplicated(keep="last")]["close"]*leg["lots"])
-                    time.sleep(0.25)  # space out rapid-fire candle requests
             if ok and len(raw)==4:
                 idx=raw[0].index
                 s=[r.reindex(idx,method="ffill").fillna(0) for r in raw]
@@ -577,7 +562,6 @@ with tab1:
     with lr[1]:  sx_exch =st.selectbox("Exchange",["BSE","NSE"],index=0,key="sx_exch")
     with lr[2]:  sx_under=st.selectbox("Underlying",["SENSEX","BANKEX","NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY"],index=0,key="sx_under")
     _sx=get_expiries_for(sx_exch,sx_under)
-    time.sleep(0.4)  # space out the two back-to-back optionchain calls below
     with lr[3]:  sx_ce_exp=expiry_selectbox("CE Expiry",_sx,"sx_ce_m","sx_ce_s","260612")
     with lr[4]:  sx_pe_exp=expiry_selectbox("PE Expiry",_sx,"sx_pe_m","sx_pe_s","260612")
     with lr[5]:  sx_ce_str=st.number_input("CE Strike",value=80000,step=100,key="sx_ce_str")
@@ -603,13 +587,12 @@ with tab1:
         fyers=get_fyers()
         if not fyers: return pd.DataFrame()
         with st.spinner("Fetching..."):
-            dsc=fetch_candles(fyers,sym_sx_ce,cint1,date_str); time.sleep(0.2)
-            dsp=fetch_candles(fyers,sym_sx_pe,cint1,date_str); time.sleep(0.2)
-            dnc=fetch_candles(fyers,sym_nf_ce,cint1,date_str); time.sleep(0.2)
-            dnp=fetch_candles(fyers,sym_nf_pe,cint1,date_str); time.sleep(0.2)
+            dsc=fetch_candles(fyers,sym_sx_ce,cint1,date_str)
+            dsp=fetch_candles(fyers,sym_sx_pe,cint1,date_str)
+            dnc=fetch_candles(fyers,sym_nf_ce,cint1,date_str)
+            dnp=fetch_candles(fyers,sym_nf_pe,cint1,date_str)
             dss=fetch_candles(fyers,"BSE:SENSEX-INDEX",cint1,date_str)
             if dss.empty: dss=fetch_candles(fyers,"BSE:SENSEX",cint1,date_str)
-            time.sleep(0.2)
             dns=fetch_candles(fyers,"NSE:NIFTY50-INDEX",cint1,date_str)
             if dns.empty: dns=fetch_candles(fyers,"NSE:NIFTY50",cint1,date_str)
         if any(d.empty for d in [dsc,dsp,dnc,dnp]):
@@ -722,9 +705,7 @@ with tab3:
     ivr=st.columns([1.2,1,1,1,1,1,1,1.5])
     with ivr[0]: iv_date=st.date_input("Date",value=default_date,key="iv_date")
     with ivr[1]: iv_int =st.selectbox("Interval (min)",[1,3,5,10,15,30,60],index=2,key="iv_int")
-    _ivsx=get_expiries_for("BSE","SENSEX")
-    time.sleep(0.4)  # space out the two back-to-back optionchain calls below
-    _ivnf=get_expiries_for("NSE","NIFTY")
+    _ivsx=get_expiries_for("BSE","SENSEX"); _ivnf=get_expiries_for("NSE","NIFTY")
     with ivr[2]: sx_exp=expiry_selectbox("Sensex Expiry",_ivsx,"iv_sx_m","iv_sx_s","260612")
     with ivr[3]: nf_exp=expiry_selectbox("Nifty Expiry", _ivnf,"iv_nf_m","iv_nf_s","260610")
     with ivr[4]: iv_rfr=st.number_input("Risk-Free %",value=6.5,step=0.1,key="iv_rfr")
@@ -742,7 +723,6 @@ with tab3:
             with st.spinner("Fetching spot..."):
                 dss=fetch_candles(fyers,"BSE:SENSEX-INDEX",iv_int,iv_ds)
                 if dss.empty: dss=fetch_candles(fyers,"BSE:SENSEX",iv_int,iv_ds)
-                time.sleep(0.3)
                 dns=fetch_candles(fyers,"NSE:NIFTY50-INDEX",iv_int,iv_ds)
                 if dns.empty: dns=fetch_candles(fyers,"NSE:NIFTY50",iv_int,iv_ds)
             if dss.empty or dns.empty:
@@ -777,7 +757,6 @@ with tab3:
                     for key,sym in all_syms.items():
                         df_o=fetch_candles(fyers,sym,iv_int,iv_ds)
                         fetched[key]=df_o[~df_o.index.duplicated(keep="last")] if not df_o.empty else df_o
-                        time.sleep(0.15)  # space out bulk option-series fetches to avoid rate-limit
                 r=iv_rfr/100; exp_sx=exp2date(sx_exp); exp_nf=exp2date(nf_exp)
                 def div_series(spot_df,sk_series,fetched_d,pfx,exp_dt,ot):
                     oiv={}; osk={}
