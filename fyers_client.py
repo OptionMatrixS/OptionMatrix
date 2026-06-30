@@ -77,9 +77,30 @@ def market_badge_html():
 # ── Secrets helper ────────────────────────────────────────────────────────────
 def _sec(k, default=""):
     try:
-        if k in st.secrets: return str(st.secrets[k]).strip()
-    except Exception: pass
+        val = st.secrets.get(k)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    except Exception:
+        pass
     return os.environ.get(k, default).strip()
+
+
+def debug_secrets():
+    """Returns a dict showing which Fyers secret keys are visible right now,
+    without exposing their values. Call this from anywhere in the app
+    (e.g. temporarily in a tab) to diagnose 'Missing secrets' errors."""
+    keys = ["FYERS_CLIENT_ID", "FYERS_APP_ID", "FYERS_APP_TYPE",
+            "FYERS_SECRET_KEY", "FYERS_PIN", "FYERS_TOTP_KEY"]
+    out = {}
+    try:
+        top_level_keys = list(st.secrets.keys())
+    except Exception as e:
+        top_level_keys = [f"<error reading st.secrets: {e}>"]
+    for k in keys:
+        v = _sec(k)
+        out[k] = f"present (len={len(v)})" if v else "MISSING"
+    out["_all_top_level_secret_keys"] = top_level_keys
+    return out
 
 # ── Token file ────────────────────────────────────────────────────────────────
 def _save_token(token):
