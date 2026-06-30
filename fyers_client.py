@@ -280,6 +280,37 @@ def render_token_status():
         if st.button("🔄", key="_refresh_tok", help="Refresh Fyers token"):
             refresh_token(); st.rerun()
 
+# ── Small parsing helpers (used by live_bhavcopy.py) ──────────────────────────
+def _to_float(v):
+    """Safe float conversion — returns 0.0 for None/empty/unparseable values."""
+    try:
+        if v is None or v == "":
+            return 0.0
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_expiry_date(edata_entry):
+    """Parse one entry from Fyers optionchain's expiryData list into a date object.
+    Each entry looks like {"date": "DD-MM-YYYY", "expiry": "<epoch>"}."""
+    d = edata_entry.get("date", "") if isinstance(edata_entry, dict) else ""
+    dd, mm, yyyy = d.split("-")
+    return date(int(yyyy), int(mm), int(dd))
+
+
+def get_chain(index, epoch):
+    """Fetch the full option chain for `index` at a specific expiry `epoch`
+    (the raw 'expiry' timestamp string Fyers returns in expiryData)."""
+    fc_client = get_fyers_client()
+    sym = INDEX_SYMBOLS.get(index, f"NSE:{index}-INDEX")
+    r = fc_client.optionchain(data={"symbol": sym, "strikecount": 0,
+                                      "timestamp": str(epoch)})
+    if not (r and r.get("s") == "ok"):
+        raise ValueError(f"Cannot load chain for {index} @ {epoch}: {r}")
+    return r.get("data", {}).get("optionsChain", [])
+
+
 # ── Expiries ──────────────────────────────────────────────────────────────────
 def get_expiries(index):
     ck = f"exp_{index}"
@@ -310,6 +341,24 @@ def get_expiries(index):
         result[label] = code
     st.session_state[ck] = result
     return list(result.keys())
+
+# Alias — spread_chart.py / position_analysis.py call fc.expiry_labels(),
+# but the actual implementation above is named get_expiries(). Without this
+# alias every call raises AttributeError, which is caught and silently
+# stored in st.session_state["_fy_err"] (or simply swallowed depending on
+# the call site), producing the empty-expiry-list "Waiting for Fyers
+# expiry data…" message with no visible error.
+expiry_labels = get_expiries
+
+def find_expiry(index, label):
+    """Return {'code':..., 'date':...} for a given expiry label, or None."""
+    code = _label_to_code(label, index)
+    if not code:
+        return None
+    try:
+        return {"code": code, "date": _expiry_date(label, index)}
+    except Exception:
+        return None
 
 def _label_to_code(label, index="NIFTY"):
     """Convert expiry label → Fyers code. Works WITHOUT session state."""
@@ -441,6 +490,28 @@ def get_spread_value(legs):
             missing.append(f"{leg['index']} {leg['strike']}{leg.get('cp',leg.get('opt_type'))}")
     err = f"No price: {', '.join(missing)}" if missing else None
     return round(total, 2), err
+
+def spread_value(legs, quotes):
+    """Compute spread value from an ALREADY-FETCHED quotes dict (no extra API call).
+    Used by spread_chart.py's live feed, which fetches quotes once and reuses them.
+    Returns a single float (not a tuple) — raises if a required quote is missing."""
+    total = 0.0
+    missing = []
+    for leg in legs:
+        try:
+            sym = leg_to_symbol(leg)
+        except Exception:
+            continue
+        ltp = quotes.get(sym, {}).get("ltp", 0.0)
+        side = leg.get("bs") or leg.get("side")
+        if ltp:
+            sign = 1 if side == "Buy" else -1
+            total += sign * ltp * leg.get("ratio", 1)
+        else:
+            missing.append(f"{leg.get('index')} {leg.get('strike')}{leg.get('cp', leg.get('opt_type'))}")
+    if missing:
+        raise ValueError(f"No price for: {', '.join(missing)}")
+    return round(total, 2)
 
 # ── Candles ───────────────────────────────────────────────────────────────────
 TIMEFRAMES = {"1m":"1","3m":"3","5m":"5","10m":"10","15m":"15","30m":"30","60m":"60","1D":"D"}
